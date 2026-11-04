@@ -1,0 +1,25 @@
+[workspace]
+members = [
+  "extensions/agent-loop-basic",
+  "extensions/guard-shell",
+  "extensions/llm-anthropic",
+  "extensions/llm-openai-compat",
+  "extensions/mcp-bridge",
+  "extensions/skill-loader",
+  "extensions/tools-fs",
+  "extensions/tools-shell",
+  "extensions/ui-cli",
+  "extensions/ui-web",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.89.0"
+license = "MIT"
+
+[workspace.dependencies]
+# Depender do SDK por versão/tag, nunca por path (prova que terceiros conseguem).
+# Ajuste a URL quando o repo `atom` estiver no GitHub.
+# atom-sdk = { git = "https://github.com/wkoch/atom", tag = "v1.0.0" }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }

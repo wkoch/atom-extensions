@@ -1,0 +1,48 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  rust:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+
+  manifests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: atom.toml válido e versão igual ao Cargo.toml
+        run: |
+          python3 - <<'PY'
+          import pathlib, sys, tomllib, json
+          bad = 0
+          for m in sorted(pathlib.Path(".").glob("*/*/atom.toml")):
+              d = tomllib.loads(m.read_text())
+              for f in ("manifest", "name", "version", "kind"):
+                  if f not in d:
+                      print(f"{m}: falta {f}"); bad += 1
+              c = m.parent / "Cargo.toml"
+              if c.exists():
+                  cv = tomllib.loads(c.read_text())["package"]["version"]
+                  if cv != d.get("version"):
+                      av = d.get("version")
+                      print(f"{m}: versão {av} != Cargo {cv}")
+                      bad += 1
+          for s in pathlib.Path("contracts").rglob("*.json"):
+              try: json.loads(s.read_text())
+              except Exception as e: print(f"{s}: {e}"); bad += 1
+          sys.exit(1 if bad else 0)
+          PY

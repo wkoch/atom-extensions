@@ -1,0 +1,6 @@
+/target/
+**/target/
+/out/
+node_modules/
+*.wasm
+!**/fixtures/*.wasm

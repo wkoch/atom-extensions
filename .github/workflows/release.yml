@@ -1,0 +1,108 @@
+# Release por pacote (ADR-E005). Tag: <dir>@<versão>, ex.: tools-fs@0.2.1
+# Secrets:
+#   ATOM_PUBLISHER_KEY  seed ed25519 do publisher "atom"
+#   ATOM_STORE_TOKEN    token p/ abrir PR no atom-store
+# Vars:
+#   ATOM_STORE_REPO     ex.: org/atom-store
+#   ATOM_VERSION        release do CLI atom usado p/ pack
+name: release
+on:
+  push:
+    tags: ["*@*"]
+
+jobs:
+  meta:
+    runs-on: ubuntu-latest
+    outputs:
+      dir: ${{ steps.m.outputs.dir }}
+      rust: ${{ steps.m.outputs.rust }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: m
+        run: |
+          name="${GITHUB_REF_NAME%@*}"
+          ver="${GITHUB_REF_NAME#*@}"
+          dir=""
+          for d in extensions mods contracts distributions; do
+            [ -d "$d/$name" ] && dir="$d/$name"
+          done
+          [ "$name" = "kit" ] && dir="kit"
+          [ -n "$dir" ] || { echo "pacote $name não encontrado"; exit 1; }
+          grep -q "^version = \"$ver\"" "$dir/atom.toml" \
+            || { echo "tag $ver != atom.toml"; exit 1; }
+          echo "dir=$dir" >> "$GITHUB_OUTPUT"
+          if [ -f "$dir/Cargo.toml" ]; then rust=true; else rust=false; fi
+          echo "rust=$rust" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: meta
+    if: needs.meta.outputs.rust == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            platform: linux-amd64
+            zig: true
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            platform: linux-arm64
+            zig: true
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            platform: darwin-arm64
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            platform: darwin-amd64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            platform: windows-amd64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - if: matrix.zig
+        run: |
+          pip install ziglang
+          cargo install cargo-zigbuild --locked
+      - shell: bash
+        env:
+          DIR: ${{ needs.meta.outputs.dir }}
+          TARGET: ${{ matrix.target }}
+          ZIG: ${{ matrix.zig }}
+        run: |
+          pkg=$(python3 -c "import tomllib,os;print(tomllib.load(
+            open(os.environ['DIR']+'/Cargo.toml','rb'))['package']['name'])")
+          build=build
+          [ "$ZIG" = "true" ] && build=zigbuild
+          cargo "$build" --release -p "$pkg" --target "$TARGET"
+          mkdir -p stage/bin
+          # TODO(E0): copiar binário p/ o `entrypoint` do atom.toml
+          # e rodar `atom ext pack --platform <platform>`.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pkg-${{ matrix.platform }}
+          path: stage
+
+  publish:
+    needs: [meta, build]
+    if: >-
+      always() && needs.meta.result == 'success' &&
+      (needs.build.result == 'success' || needs.build.result == 'skipped')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: staged
+      - name: pack + release + PR na loja
+        env:
+          ATOM_PUBLISHER_KEY: ${{ secrets.ATOM_PUBLISHER_KEY }}
+          GH_TOKEN: ${{ secrets.ATOM_STORE_TOKEN }}
+        run: |
+          # TODO(E0): instalar CLI atom (vars.ATOM_VERSION), atom ext pack,
+          # gh release create, PR em vars.ATOM_STORE_REPO.
+          echo "Ver docs/releasing.md"
