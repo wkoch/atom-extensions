@@ -42,3 +42,35 @@ contexto → decisão → consequência. Não editar; substituir com nova ADR.
 - **Decisão:** cada diretório é um pacote com versão própria; tag `<dir>@<versão>` publica só ele.
   `atom.toml` e `Cargo.toml` devem ter a mesma versão (CI verifica). Pacotes sem binário são `any`.
 - **Consequência:** sem "release do repo inteiro"; CI de PR roda só no que mudou (+ dependentes).
+
+## ADR-E006 — Contribuições de UI são dados primeiro (implementa ADR-025 do core)
+- **Contexto:** ADR-025 (core) emenda ADR-016 §3–4: contribuição deixa de ser "dados + componente JS" e vira
+  descritor serializável; componentes são opcionais e por superfície. O trabalho é todo deste repo. Hoje os
+  schemas `ui.*@0` descrevem o renderer como "função JS no módulo" e `ui.views` aceita `module`/`html`.
+- **Decisão:** spec `specs/ui-contributions.md`: descritor base (`id`, `title|label`, `icon`, `order`, `when`,
+  `action`, `points`, `surfaces`), ações `call|command|view`, componentes em `surfaces.web|tui`, renderers
+  por superfície (`[contributes.renderers."<ponto>".web]`). `ui-cli` passa a renderizar menus/views/settings
+  genericamente na superfície `tui`. Emenda ADR-E002: o `InitIn.items` da ABI WASM são descritores.
+- **Consequência:** qualquer frontend reaproveita as contribuições; mods ficam menores (muitos viram só
+  declarativos). Quebra dos `ui.*@0` registrada no CHANGELOG (ADR-014); shell aceita a forma antiga com aviso
+  até E3.
+
+## ADR-E007 — Extensões oficiais alinhadas ao core v1.1
+- **Contexto:** o core v1.1 adicionou ao `atom/1`, de forma opt-in: `$/cancelRequest` propagado ao provider,
+  `$ctx.deadline`, backpressure padrão + `flow` (window/credit), `-32050`/`-32022`/`-32041`, eventos com
+  `epoch/offset/from/gap`, KV versionado + `watch`, e identidade por conexão (extensão conectando no socket
+  do daemon recebe `-32005`; editar `grants.toml`/`profile.toml` por fora é ignorado). As extensões deste repo
+  foram extraídas na v1.0, reimplementam o protocolo à mão e fixam o SDK num commit pré-v1.1.
+- **Decisão:**
+  1. Toda extensão Rust usa `atom-sdk` v1.1 (tag). O SDK é o único lugar que implementa cancelamento,
+     deadline e crédito; nenhuma extensão reimplementa.
+  2. Providers tratam cancelamento (`$/cancelRequest` e `atom.stream.cancel`) e respeitam `deadline` nas
+     sub-chamadas (via SDK). Providers de stream longo (`llm-*`, `agent-loop-basic`) declaram
+     `flow = "credit"`.
+  3. Nenhuma extensão se conecta ao socket do daemon nem edita arquivos do perfil; bindings/grants mudam só
+     por comandos de cliente confiável (`atom bind`, `atom grants`).
+  4. Pacote que usa recurso v1.1 declara `engine = ">=1.1.0, <2.0.0"`; os demais `">=1.0.0, <2.0.0"`.
+  5. Capabilities `fs.*`, `net`, `exec`, `ui.serve` são documentadas como *advisory* no README de cada pacote.
+- **Consequência:** comportamento consistente sob cancelamento/prazo/carga; dependência dos itens pendentes do
+  core (SDK com `$/cancelRequest`, tag publicada). O `ui-web` depende de `atom.ui.session`, que o core vai
+  restringir (`atom/docs/specs/protocol.md §9.0`): o shell deve pedir a capability que o core definir.

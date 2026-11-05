@@ -9,8 +9,9 @@ name = "atom/menu-top"
 version = "0.9.0"
 kind = "ui-mod"
 
-[contributes.renderers]
-"ui.menu.items" = { wasm = "mod.wasm", abi = "atom-mod/0" }
+[contributes.renderers."ui.menu.items".web]    # renderer por superfície (ui-contributions.md §4)
+wasm = "mod.wasm"
+abi = "atom-mod/0"
 
 [contributes.layout]           # dicas de tamanho (ui-layout.md)
 "ui.menu.items" = { min = "28px", preferred = "32px", grow = 0 }
@@ -42,7 +43,7 @@ Nada mais: **todo efeito é dado de retorno** (abaixo), não chamada direta. Sim
 ```jsonc
 // InitIn
 {"abi": "atom-mod/0", "mod": "atom/menu-top", "point": "ui.menu.items",
- "items": [/* contribuições do ponto, se renderer */], "state": {/* último estado salvo ou null */},
+ "items": [/* descritores validados do ponto (ui-contributions.md), se renderer */], "state": {/* último estado salvo ou null */},
  "config": {/* config do mod */}, "locale": "pt-BR"}
 
 // Event (vindo do shell)
@@ -52,11 +53,12 @@ Nada mais: **todo efeito é dado de retorno** (abaixo), não chamada direta. Sim
 {"type": "reply", "id": 7, "err": {"code": -32003, "message": "..."}}
 {"type": "stream", "id": 8, "chunk": {...}} | {"type": "stream", "id": 8, "end": true}
 {"type": "event", "topic": "ai.agent.done", "data": {...}}
+{"type": "gap", "topic": "ai.agent.*"}                  // eventos perdidos (atom.events.gap); o mod deve reler o estado
 {"type": "config", "config": {...}}
 
 // UpdateOut (devolvido pelo mod)
 {"dirty": true, "state": {/* opcional: persistir */}, "effects": [
-  {"id": 7, "call": {"service": "ai.agent@0", "method": "run", "params": {...}, "stream": true}},
+  {"id": 7, "call": {"service": "ai.agent@0", "method": "run", "params": {...}, "stream": true, "timeout_ms": 60000}},
   {"id": 9, "cancel": 8},
   {"subscribe": "ai.agent.*"},
   {"navigate": {"view": "chat"}},
@@ -66,9 +68,17 @@ Nada mais: **todo efeito é dado de retorno** (abaixo), não chamada direta. Sim
 
 ## 5. Regras do host
 - Um Worker por instância de mod; travou > 2s em uma chamada → terminado, boundary mostra erro, botão "recarregar".
-- `call`/`subscribe` passam pelos **grants do mod** (`service:<contrato>`, `event:<tópico>`), concedidos como em
-  `capabilities.md` do core. Sem grant → `reply` com `-32003`.
-- `state` é salvo via storage do bus chaveado por `(mod, contribuição)` (ADR-016 §7); limite 256 KiB.
+- `call`/`subscribe` passam pelos **grants do mod** (`service:<contrato@major>`, `events.subscribe:<glob>`), concedidos
+  como em `capabilities.md` do core. Sem grant → `reply` com `-32003`. A conexão WS do shell tem autoridade de
+  cliente confiável no core; **o shell é quem aplica** os grants de cada mod (o core não vê o mod).
+- `timeout_ms` vira `$ctx.deadline = agora + timeout_ms` na chamada (core v1.1, limitado por `[bus] max_deadline_ms`);
+  estouro → `reply` com `-32022`. `cancel` vira `atom.stream.cancel` (stream) ou `$/cancelRequest` (request).
+- Streams para mods usam `flow.window` + `atom.stream.ack` na conexão WS: o shell só acka o que o Worker consumiu,
+  então mod lento não faz a memória do shell crescer. Sobrecarga do core → `reply`/`stream` com `-32050`.
+- `subscribe` reconecta com `from: {epoch, offset}` após queda do WS; lacuna → evento `gap` ao mod.
+- `state` é salvo via storage do bus chaveado por `(mod, contribuição)` (ADR-016 §7); limite 256 KiB. Escrita com
+  `if_version` da última leitura (core v1.1, `[P-KV-4]`): em `-32041` (outra aba gravou) o shell relê, entrega o estado
+  novo ao mod como `config`/`init` e descarta a escrita. `atom.storage.watch` no prefixo do mod sincroniza abas.
 - Navegação e `notify` são pedidos; o shell decide.
 - Panic do mod (`unreachable`) = mesmo tratamento de travamento.
 

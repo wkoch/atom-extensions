@@ -29,10 +29,13 @@ Arquivo JSON referenciado em `[contributes.contract].schema`:
 - `multi: true` = contrato pensado para muitos providers simultâneos (chamados por `target` ou listados via `atom.registry.list`), sem binding único.
 - Regras de evolução dentro do mesmo major: só adicionar métodos e campos opcionais. Quebra = novo major (`@1`), que pode coexistir.
 - Validação (se `validation.contracts = true` no perfil): core valida `params` antes de `service.invoke` e `result` antes de devolver; falha → `-32013`.
+- `points` (opcional, contratos de UI): pontos de contribuição do contrato — formato em `ui-contributions.md §5` (ADR-E006). O core não lê `points`; só o shell/renderers.
+- Erros que todo provider/consumidor deve esperar além dos do contrato (core v1.1, `atom/docs/specs/protocol.md §11`): `-32800` cancelado, `-32022` prazo (`$ctx.deadline`) estourado, `-32050` sobrecarga, `-32010` provider indisponível. Métodos com `stream` seguem o controle de fluxo do core (`[P-STREAM-1..4]`): produtor nunca descarta chunks e pode declarar `flow = "credit"`.
+- Contratos não definem prazos próprios: quem precisa de prazo usa `$ctx.deadline`.
 
 ## 2. Contratos iniciais de IA (rascunho, para v0.2+)
 
-Mínimos para dogfooding. Defina-os como pacotes em `extensions/contracts/`. Descrições abaixo são de intenção; o schema exato é decidido ao implementar a primeira extensão de cada um.
+Mínimos para dogfooding. Pacotes em `contracts/` deste repo. Descrições abaixo são de intenção; o schema exato é decidido ao implementar a primeira extensão de cada um.
 
 ### `ai.llm@0` (single, por binding)
 - `complete({model?, messages[], tools?[], params?})` → `{message, usage, stop_reason}`; stream de chunks `{delta_text?, delta_tool_call?, usage?}`.
@@ -58,11 +61,11 @@ Mínimos para dogfooding. Defina-os como pacotes em `extensions/contracts/`. Des
 ### `ui.prompt@0` (single, normalmente fornecido por cliente UI conectado)
 - `confirm({title, detail})` → `{ok}`; `ask({title, schema})` → `{value}`; `notify({level, text})`. Usado para aprovações (tools perigosas, grants).
 
-### Contratos de UI web / mods (v0.8, regras em ADR-016)
-Os schemas detalhados são definidos na v0.8. Regras fixas desde já:
+### Contratos de UI / mods (v0.8, regras em ADR-016 + ADR-025 do core)
+Schemas em `contracts/ui-*`; formato das contribuições em `ui-contributions.md` (dados primeiro: descritor + componentes opcionais por superfície). Regras fixas:
 - `atom/ui-web` é só um shell (assets, ponte WS, loader de `ui-mod`, ponto raiz `ui.root`); não contém telas.
 - Pontos de contribuição são **semânticos** e vivem em pacotes `kind="contract"` próprios (ex.: `ui.menu@0` → ponto `ui.menu.items`; `ui.settings@0` → `ui.settings.sections`; `ui.views@0`; `ui.status@0`). Proibido nomear por posição/apresentação (`topbar`, `sidebar`, `popup`).
-- Cada ponto tem: contribuições `multi` (mods de conteúdo declaram itens) e **um renderer** `single` escolhido no perfil (mods de layout). Contribuidor e renderer só conhecem o contrato.
+- Cada ponto tem: contribuições `multi` (mods de conteúdo declaram descritores) e **um renderer** `single` por superfície escolhido no perfil (`atom bind <ponto> <pkg>`). Contribuidor e renderer só conhecem o contrato.
 - Qualquer mod pode declarar pontos próprios (aninhamento) com as mesmas regras.
 - Estado de UI é chaveado pelo mod/contribuição, nunca pelo container.
 - Exemplo de aceite: trocar o renderer de `ui.menu.items` (menu superior → menu lateral) ou de `ui.settings` (popup → painel lateral) mantém todos os itens e mods internos sem reinstalar ou alterar nada além do renderer.
@@ -74,6 +77,6 @@ Os schemas detalhados são definidos na v0.8. Regras fixas desde já:
 | `skill` | `atom/skill-loader` | `{file = "SKILL.md", scripts = "scripts/", runtime?}`; registra em `ai.context@0` (descrição) e `ai.tools@0` (se tiver scripts) |
 | `mcp` | `atom/mcp-bridge` | `{transport = "stdio|http", command?, args?, url?, env_secrets?}`; sobe o servidor MCP e expõe suas tools como `ai.tools@0` (um target por servidor) |
 | `prompt` | extensão de UI/agente | templates |
-| `ui-mod` | `atom/ui-web` (shell) | assets + contribuições em pontos semânticos / renderer de pontos (ADR-016) |
+| `ui-mod` | `atom/ui-web` (shell; `ui-cli` na superfície `tui`) | descritores em pontos semânticos + componentes opcionais por superfície / renderer de pontos (ADR-016, ADR-E006) |
 
 Comportamentos de MCP que precisam de hooks = pacote `mcp` + extensão executável com `intercepts` (ou um pacote executável que faça ambos).

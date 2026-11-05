@@ -2,8 +2,10 @@
 
 Extensões, contratos, mods de UI e distributions **oficiais** do [Atom](https://github.com/wkoch/atom).
 
-O core (`atom`) é um microkernel congelado em `atom/1`; tudo que tem domínio
-(IA, UI, temas, layouts) vive aqui e é publicado na loja (`atom-store`).
+O core (`atom`) é um microkernel com protocolo `atom/1` congelado (v1.0; a v1.1 só adiciona recursos
+opt-in); tudo que tem domínio (IA, UI, temas, layouts) vive aqui e é publicado na loja (`atom-store`,
+`store/v1` hoje, `store/v2` TUF em transição). O alinhamento das extensões ao core v1.1 está em
+`docs/roadmap.md` (E0.1).
 
 ```
 contracts/       pacotes kind="contract" (ai.*, ui.*) — JSON Schemas

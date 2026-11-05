@@ -24,7 +24,7 @@ atom-mount { display: block; contain: layout paint style; min-width: 0; min-heig
 - Timeout de primeiro render: 3s → placeholder (mod continua tentando).
 
 ## 3. Troca de mod/renderer/tema
-1. Shell obtém o novo binding (evento `atom.config.changed`).
+1. Shell obtém o novo binding (evento `atom.binding.changed` `{contract}` do core, emitido por `atom bind`; editar `[bindings]` à mão só vale após `atom profile reload`, `[C-AMB-3]`).
 2. Salva `state` das instâncias afetadas (já persistido a cada `update`).
 3. `document.startViewTransition()` (se disponível) → desmonta renderer antigo → monta o novo com as **mesmas
    contribuições** e estado restaurado.

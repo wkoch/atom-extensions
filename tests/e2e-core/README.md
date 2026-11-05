@@ -13,7 +13,10 @@ ATOM_BIN=/caminho/para/atom cargo test -p atom-e2e-core --test web_e2e
 - `web_e2e` sobe o daemon do core. Gere o binário no mesmo commit das deps:
   `cargo install --git https://github.com/wkoch/atom --rev <rev> --locked atom --root /tmp/atom-core-bin`
 - Deps do core (`atom-core`, `atom-sdk`, `atom-protocol`) estão fixadas em `rev` no
-  `Cargo.toml` da raiz. Atualize junto com o core. A tag `v1.0.0` é anterior ao core atual.
+  `Cargo.toml` da raiz. Atualize junto com o core. A tag `v1.0.0` é anterior ao core atual, e o `rev`
+  atual (`aea211f`) também é anterior ao v1.1: atualizar para a tag v1.1 do core é item do roadmap E0.1.
+- Com o core v1.1: um processo filho do daemon que se conecta ao socket recebe `-32005`. Testes que precisam de
+  cliente devem conectar a partir do processo de teste (não de uma extensão).
 - Repo `atom` é privado: `cargo` precisa de acesso (`CARGO_NET_GIT_FETCH_WITH_CLI=true` com
   credencial do `gh`). Em CI isso exige token ou repo público.
 - `testdata/` (echo, fake-llm, mcp-fake, prompt-fake, skill-fake, kind-xyz, py-echo,

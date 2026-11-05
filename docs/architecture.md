@@ -4,9 +4,9 @@
 
 | Repo | Conteúdo | Ritmo | Segredos |
 |---|---|---|---|
-| `atom` | core, `atom-protocol`, `atom-sdk`, `sdks/atom-ts`, `testdata/`, conformance, specs do kernel | lento (congelado em `atom/1`) | chave de release do binário |
-| `atom-extensions` (este) | contratos, extensões, mods, ui-kit, distributions | rápido, versão por pacote | chave de **publisher** `atom` |
-| `atom-store` | índices `store/v1`, `publishers/` | a cada publicação | chave da **loja** (índice) |
+| `atom` | core, `atom-protocol`, `atom-sdk`, `sdks/atom-ts`, `testdata/`, conformance, specs do kernel | lento (`atom/1` congelado; v1.1 aditiva) | chave de release do binário |
+| `atom-extensions` (este) | contratos, extensões, mods, ui-kit, distributions | rápido, versão por pacote | chave de **publisher** `atom` (v1: assina artefatos; v2: assina o papel delegado `publisher:atom`) |
+| `atom-store` | índices `store/v1`, metadados `store/v2` (TUF), `publishers/` | a cada publicação + cron diário (`timestamp` v2) | v1: chave da **loja** (índice); v2: `root`/`targets` offline, `snapshot`/`timestamp` no CI |
 
 Dependências só em uma direção: `atom-extensions` → `atom` (SDK por versão publicada);
 `atom-store` não depende de nenhum (só dados + CLI `atom` no CI).
@@ -42,7 +42,8 @@ mod.wasm (Worker, sem DOM)               shell (main thread)
 ```
 
 Níveis de mod (do preferido ao último recurso):
-1. **Declarativo** — só `contributes` no `atom.toml` (itens de menu, campos de settings).
+1. **Declarativo** — só descritores em `contributes` no `atom.toml` (itens de menu, views, campos de settings),
+   renderizados genericamente por qualquer superfície (ADR-E006).
 2. **Árvore** — WASM em Worker devolvendo `ui.tree@0`. Padrão para mods oficiais.
 3. **Superfície** — elemento com Shadow DOM (oficiais) ou `<iframe sandbox>` (terceiros), para
    editor/canvas. Exige capability `ui.surface`.
@@ -61,4 +62,10 @@ Ver `specs/ui-layout.md`, `specs/ui-theme.md`, `specs/ui-kit.md`. Resumo:
 - Extensões reimplementam o protocolo (só `serde_json`) em vez de usar `atom-sdk`. → roadmap E0.
 - `extensions/ui-web/assets/style.css` contém estilos de mods (`.menu`, `.chat-log`, `.settings-*`),
   violando ADR-016. → roadmap E1.
-- Contratos `ui.*` descrevem renderer como "função JS no módulo"; ganham versão para WASM em E2.
+- Contratos `ui.*` descrevem renderer como "função JS no módulo" e contribuição como "dados + módulo JS";
+  viram descritores com componentes por superfície (ADR-E006, `specs/ui-contributions.md`). → roadmap E0.2.
+- Extensões foram extraídas na v1.0 e não conhecem o v1.1: não tratam `$/cancelRequest`, não propagam
+  `deadline`, não usam `flow`, `engine = ">=0.1.0"` sem teto; SDK fixado em commit pré-v1.1. → roadmap E0.1.
+- `ui-web` depende de métodos do core fora da spec (`atom.ui.serve`, `atom.ui.session`, `atom.packages.mods`,
+  `atom.packages.asset`; `atom/docs/specs/protocol.md §9.0`). O token WS que o shell recebe tem autoridade
+  total de cliente: hoje o **shell** é o único ponto que pode aplicar grants por mod. → roadmap E0.1.
