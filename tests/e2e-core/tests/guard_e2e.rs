@@ -132,11 +132,7 @@ async fn contract_validation_rejects_invalid_params() {
         "atom-tools-shell",
     )
     .await;
-    install_contract(
-        &mut core,
-        "extensions/contracts/ai-tools",
-        "atom/contract-ai-tools",
-    );
+    install_contract(&mut core, "contracts/ai-tools", "atom/contract-ai-tools");
     core.config.validation.contracts = true;
 
     // Params válidos passam mesmo com validação ligada.

@@ -92,11 +92,7 @@ async fn dormant_without_handler_is_not_an_error() {
 async fn bootstrap_kinds_load_in_core() {
     let home = tempfile::tempdir().unwrap();
     let mut core = Core::open_with("default", Some(home.path())).await.unwrap();
-    install_data(
-        &mut core,
-        "extensions/contracts/ai-tools",
-        "atom/contract-ai-tools",
-    );
+    install_data(&mut core, "contracts/ai-tools", "atom/contract-ai-tools");
     install_data(
         &mut core,
         "extensions/runtime-python",
@@ -120,7 +116,7 @@ async fn skill_loads_and_collects_in_chat_context() {
     let mut core = Core::open_with("default", Some(home.path())).await.unwrap();
     install_data(
         &mut core,
-        "extensions/contracts/ai-context",
+        "contracts/ai-context",
         "atom/contract-ai-context",
     );
     install_exec(
@@ -161,11 +157,7 @@ async fn skill_loads_and_collects_in_chat_context() {
 async fn mcp_stdio_lists_and_executes() {
     let home = tempfile::tempdir().unwrap();
     let mut core = Core::open_with("default", Some(home.path())).await.unwrap();
-    install_data(
-        &mut core,
-        "extensions/contracts/ai-tools",
-        "atom/contract-ai-tools",
-    );
+    install_data(&mut core, "contracts/ai-tools", "atom/contract-ai-tools");
     install_exec(
         &mut core,
         "extensions/mcp-bridge",
@@ -231,11 +223,7 @@ async fn mcp_stdio_lists_and_executes() {
 async fn mcp_http_lists_and_executes() {
     let home = tempfile::tempdir().unwrap();
     let mut core = Core::open_with("default", Some(home.path())).await.unwrap();
-    install_data(
-        &mut core,
-        "extensions/contracts/ai-tools",
-        "atom/contract-ai-tools",
-    );
+    install_data(&mut core, "contracts/ai-tools", "atom/contract-ai-tools");
     install_exec(
         &mut core,
         "extensions/mcp-bridge",

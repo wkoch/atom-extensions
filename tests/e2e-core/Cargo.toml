@@ -1,0 +1,20 @@
+[package]
+name = "atom-e2e-core"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "e2e do core contra extensões oficiais (portados de atom/crates/atom-core/tests)"
+
+[dependencies]
+
+[dev-dependencies]
+atom-core = { workspace = true }
+atom-protocol = { workspace = true }
+serde_json = "1"
+tempfile = "3"
+tokio = { workspace = true }
+tokio-tungstenite = "0.27"
+futures-util = "0.3"
+tracing-subscriber = "0.3"

@@ -65,7 +65,8 @@ struct Daemon {
 }
 
 fn spawn_daemon(home: &Path) -> Daemon {
-    let atom_bin = bin("atom", "atom");
+    // atom-core não é membro deste workspace: aponte ATOM_BIN para o binário do core (ver README)
+    let atom_bin = std::env::var_os("ATOM_BIN").expect("defina ATOM_BIN");
     let mut child = Command::new(atom_bin)
         .args([
             "--home",
@@ -283,12 +284,12 @@ fn install_ui_stack(core: &mut Core) {
     link_bin(core, "atom/ui-web", &bin("ui-web", "atom-ui-web"));
     core.refresh().unwrap();
     for (src, name) in [
-        ("extensions/ui-layout-basic", "atom/layout-basic"),
-        ("extensions/ui-menu-top", "atom/menu-top"),
-        ("extensions/ui-menu-side", "atom/menu-side"),
-        ("extensions/ui-settings-popup", "atom/settings-popup"),
-        ("extensions/ui-settings-panel", "atom/settings-panel"),
-        ("extensions/ui-chat", "atom/chat-ui"),
+        ("mods/ui-layout-basic", "atom/layout-basic"),
+        ("mods/ui-menu-top", "atom/menu-top"),
+        ("mods/ui-menu-side", "atom/menu-side"),
+        ("mods/ui-settings-popup", "atom/settings-popup"),
+        ("mods/ui-settings-panel", "atom/settings-panel"),
+        ("mods/ui-chat", "atom/chat-ui"),
         ("testdata/ui-hello-view", "test/hello-view"),
     ] {
         install_data(core, src, name);
