@@ -24,13 +24,9 @@ rust-version = "1.89.0"
 license = "MIT"
 
 [workspace.dependencies]
-# E0: SDK/core fixados no rev pré-v1.1 `aea211f` (anterior a deadline/flow/credit/gap).
-# A tag v1.1 do core ainda NÃO existe (só v1.0.0; `main` remoto = merge da extração,
-# sem o v1.1 parcial local): trocar as três linhas abaixo pela tag v1.1
-# (`atom-sdk`, `atom-core`, `atom-protocol` juntos) assim que publicada.
-# E0.1 (flow/deadline/credit/gap/if_version) depende dessa tag.
-atom-sdk = { git = "https://github.com/wkoch/atom", rev = "aea211f99bb2f9d6234b016a6700f04cb21e7636" }
-atom-core = { git = "https://github.com/wkoch/atom", rev = "aea211f99bb2f9d6234b016a6700f04cb21e7636" }
-atom-protocol = { git = "https://github.com/wkoch/atom", rev = "aea211f99bb2f9d6234b016a6700f04cb21e7636" }
+# Core v1.1 tagueado (`atom-sdk`, `atom-core`, `atom-protocol` juntos).
+atom-sdk = { git = "https://github.com/wkoch/atom", tag = "v1.1" }
+atom-core = { git = "https://github.com/wkoch/atom", tag = "v1.1" }
+atom-protocol = { git = "https://github.com/wkoch/atom", tag = "v1.1" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "io-std", "net", "sync", "time", "signal", "fs"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }

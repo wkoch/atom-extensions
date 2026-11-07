@@ -22,6 +22,7 @@ impl atom_sdk::Handler for H {
             handles: vec!["skill".to_string()],
             intercepts: vec![],
             subscribes: vec![],
+            flow: None,
         }
     }
 

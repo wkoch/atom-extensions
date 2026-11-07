@@ -8,4 +8,5 @@ engine = ">=0.1.0, <2.0.0"
 protocol = "atom/1"
 entrypoint = "bin/ui-web"
 activation = ["onStartup"]
+capabilities = ["ui.serve"]
 subscribes = ["atom.extension.started"]

@@ -53,6 +53,13 @@ fn install_data(core: &mut Core, src: &str, pkg_name: &str) {
     let id = pkg::install_dev(&core.paths, &core.data_store, &full).unwrap();
     assert!(id.starts_with(pkg_name), "id {id} != {pkg_name}@");
     core.refresh().unwrap();
+    // Testes = CLI não-TTY: concede o declarado (mesma regra do `approve_on_install`;
+    // v1.1, ADR-026: `atom.ui.serve` exige `ui.serve`, senão `ui_url` nunca anuncia).
+    let missing = core.missing_grants(pkg_name);
+    if !missing.is_empty() {
+        core.approve_grants(pkg_name, &missing).unwrap();
+        core.refresh().unwrap();
+    }
 }
 
 // ---------------------------------------------------------------------------
