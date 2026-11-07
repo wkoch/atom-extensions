@@ -111,6 +111,7 @@ jobs:
       - name: pack + release + PR na loja
         env:
           ATOM_PUBLISHER_KEY: ${{ secrets.ATOM_PUBLISHER_KEY }}
+          GH_TOKEN: ${{ github.token }}
           STORE_TOKEN: ${{ secrets.ATOM_STORE_TOKEN }}
           ATOM_STORE_REPO: ${{ vars.ATOM_STORE_REPO }}
           ATOM_VERSION: ${{ vars.ATOM_VERSION }}
