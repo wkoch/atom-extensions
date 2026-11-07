@@ -138,11 +138,6 @@ jobs:
           done
           rm -f /tmp/publisher.key
           gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" out/*.tar.gz
-          # PR na loja (v1; v2 quando o core tiver a ferramenta pub v2 — E0.1):
-          # `atom ext publish --store-dir` mescla `out/*.index.json` sem a chave da loja.
-          git clone "https://x-access-token:${STORE_TOKEN}@github.com/${ATOM_STORE_REPO}.git" /tmp/atom-store
-          atom ext publish --store-dir /tmp/atom-store/v1 --package "$name" --version "$ver" out/*.index.json
-          (cd /tmp/atom-store && git checkout -b "pkg/${GITHUB_REF_NAME}" \
-            && git add v1 && git commit -m "publish ${GITHUB_REF_NAME}" && git push -u origin HEAD)
-          GH_TOKEN="$STORE_TOKEN" gh pr create -R "$ATOM_STORE_REPO" --head "pkg/${GITHUB_REF_NAME}" \
-            --title "publish ${GITHUB_REF_NAME}" --body "Publicação de ${GITHUB_REF_NAME} (release.yml)."
+          echo "Release criada. Para publicar na loja (manual, exige chave da loja):"
+          echo "  atom ext publish --store-dir <clone-do-atom-store>/v1 --store-key <store.key> out/*.index.json"
+          echo "  (abra PR no atom-store; o CI valida e o resign assina no merge)"
