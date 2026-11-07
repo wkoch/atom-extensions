@@ -119,7 +119,8 @@ jobs:
           rm -rf /tmp/atom-cli && mkdir -p /tmp/atom-cli
           gh release download "v${ATOM_VERSION}" -R "wkoch/atom" \
             -p "atom-v${ATOM_VERSION}-linux-amd64.tar.gz" -D /tmp/atom-cli \
-            && tar -xzf /tmp/atom-cli/atom-v${ATOM_VERSION}-linux-amd64.tar.gz -C /tmp/atom-cli \
+            && tar -xzf /tmp/atom-cli/atom-v${ATOM_VERSION}-linux-amd64.tar.gz \
+              -C /tmp/atom-cli --strip-components=1 \
             || cargo install --git https://github.com/wkoch/atom --tag "v${ATOM_VERSION}" --locked atom
           export PATH="$HOME/.cargo/bin:/tmp/atom-cli:$PATH"
           atom --version || { echo "atom CLI indisponível"; exit 1; }
