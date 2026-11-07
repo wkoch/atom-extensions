@@ -118,7 +118,7 @@ jobs:
           # CLI do core (v1.x) p/ `ext pack`/`ext publish`.
           gh release download "v${ATOM_VERSION}" -R "wkoch/atom" -p "atom-*" -D /tmp/atom-cli || \
             cargo install --git https://github.com/wkoch/atom --tag "v${ATOM_VERSION}" --locked atom
-          export PATH="/tmp/atom-cli:$PATH"
+          export PATH="$HOME/.cargo/bin:/tmp/atom-cli:$PATH"
           name="${GITHUB_REF_NAME%@*}"
           ver="${GITHUB_REF_NAME#*@}"
           dir="${{ needs.meta.outputs.dir }}"
