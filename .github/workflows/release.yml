@@ -115,13 +115,16 @@ jobs:
           ATOM_STORE_REPO: ${{ vars.ATOM_STORE_REPO }}
           ATOM_VERSION: ${{ vars.ATOM_VERSION }}
         run: |
-          # CLI do core (v1.x) p/ `ext pack`/`ext publish`.
-          gh release download "v${ATOM_VERSION}" -R "wkoch/atom" -p "atom-*" -D /tmp/atom-cli || \
-            cargo install --git https://github.com/wkoch/atom --tag "v${ATOM_VERSION}" --locked atom
+          # CLI do core (v1.x) p/ `ext pack`/`ext publish` (job roda em ubuntu-latest).
+          rm -rf /tmp/atom-cli && mkdir -p /tmp/atom-cli
+          gh release download "v${ATOM_VERSION}" -R "wkoch/atom" \
+            -p "atom-v${ATOM_VERSION}-linux-amd64.tar.gz" -D /tmp/atom-cli \
+            && tar -xzf /tmp/atom-cli/atom-v${ATOM_VERSION}-linux-amd64.tar.gz -C /tmp/atom-cli \
+            || cargo install --git https://github.com/wkoch/atom --tag "v${ATOM_VERSION}" --locked atom
           export PATH="$HOME/.cargo/bin:/tmp/atom-cli:$PATH"
+          atom --version || { echo "atom CLI indisponível"; exit 1; }
           name="${GITHUB_REF_NAME%@*}"
           ver="${GITHUB_REF_NAME#*@}"
-          dir="${{ needs.meta.outputs.dir }}"
           mkdir -p out
           # `--key` espera arquivo (0600); o secret é a seed `ed25519-seed:BASE64`.
           umask 077
