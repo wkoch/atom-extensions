@@ -1,9 +1,9 @@
 //! `atom/tools-shell`: provê `ai.tools@0` com `shell_exec`.
-//! Bloqueante com timeout via thread + `wait_timeout` manual (poll).
+//! Bloqueante com timeout via `wait_timeout` manual (poll).
 //! `shortcut: sem sandbox (caps na v0.6); shell real do usuário.`
 
+use atom_sdk::{Client, Declare, Invoke, ProvidesEntry, RpcError};
 use serde_json::{Value, json};
-use std::io::{BufRead, Write};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -84,59 +84,39 @@ fn execute(input: &Value) -> Value {
     json!({"output": [{"type": "text", "text": out}], "is_error": is_error, "exit_code": code})
 }
 
-fn main() {
-    let stdin = std::io::stdin();
-    let mut stdout = std::io::stdout();
-    for line in stdin.lock().lines() {
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => break,
-        };
-        if line.trim().is_empty() {
-            continue;
-        }
-        let req: Value = match serde_json::from_str(&line) {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("linha inválida: {e}");
-                continue;
-            }
-        };
-        let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
-        let id = req.get("id").cloned();
-        if method == "atom.exit" {
-            break;
-        }
-        let result = match method {
-            "atom.initialize" => Some(json!({
-                "protocol": "atom/1",
-                "provides": [{"contract": "ai.tools@0", "version": "0.1.0"}],
-            })),
-            "atom.shutdown" => Some(json!({})),
-            "service.invoke" => {
-                let p = req.get("params").cloned().unwrap_or(Value::Null);
-                let svc = p.get("service").and_then(|s| s.as_str()).unwrap_or("");
-                let m = p.get("method").and_then(|x| x.as_str()).unwrap_or("");
-                let ip = p.get("params").cloned().unwrap_or(Value::Null);
-                match (svc, m) {
-                    ("ai.tools@0", "list") => Some(tool_defs()),
-                    ("ai.tools@0", "execute") => {
-                        let input = ip.get("input").cloned().unwrap_or(Value::Null);
-                        Some(execute(&input))
-                    }
-                    _ => None,
-                }
-            }
-            _ => None,
-        };
-        if id.is_some() {
-            let resp = match result {
-                Some(r) => json!({"jsonrpc": "2.0", "id": id, "result": r}),
-                None => json!({"jsonrpc": "2.0", "id": id,
-                    "error": {"code": -32601, "message": format!("método {method} desconhecido")}}),
-            };
-            writeln!(stdout, "{}", serde_json::to_string(&resp).unwrap()).unwrap();
-            stdout.flush().unwrap();
+struct H;
+
+impl atom_sdk::Handler for H {
+    fn declare(&self) -> Declare {
+        Declare {
+            provides: vec![ProvidesEntry {
+                contract: "ai.tools@0".to_string(),
+                version: "0.1.0".to_string(),
+            }],
+            ..Default::default()
         }
     }
+
+    async fn on_invoke(&self, _client: &Client, inv: Invoke) -> Result<Value, RpcError> {
+        match (inv.service.as_str(), inv.method.as_str()) {
+            ("ai.tools@0", "list") => Ok(tool_defs()),
+            ("ai.tools@0", "execute") => {
+                let input = inv.params.get("input").cloned().unwrap_or(Value::Null);
+                tokio::task::spawn_blocking(move || execute(&input))
+                    .await
+                    .map_err(|e| {
+                        RpcError::new(atom_sdk::ErrorCode::INTERNAL_ERROR, format!("shell: {e}"))
+                    })
+            }
+            _ => Err(RpcError::new(
+                atom_sdk::ErrorCode::METHOD_NOT_FOUND,
+                "método service.invoke desconhecido".to_string(),
+            )),
+        }
+    }
+}
+
+#[tokio::main]
+async fn main() {
+    atom_sdk::run(H).await;
 }

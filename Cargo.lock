@@ -188,7 +188,9 @@ dependencies = [
 name = "atom-agent-loop-basic"
 version = "0.2.0"
 dependencies = [
+ "atom-sdk",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -241,31 +243,40 @@ dependencies = [
 name = "atom-guard-shell"
 version = "0.3.0"
 dependencies = [
+ "atom-protocol",
+ "atom-sdk",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]
 name = "atom-llm-anthropic"
 version = "0.2.0"
 dependencies = [
+ "atom-sdk",
  "reqwest",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]
 name = "atom-llm-openai-compat"
 version = "0.2.0"
 dependencies = [
+ "atom-sdk",
  "reqwest",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]
 name = "atom-mcp-bridge"
 version = "0.4.0"
 dependencies = [
+ "atom-sdk",
  "reqwest",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -297,35 +308,45 @@ dependencies = [
 name = "atom-skill-loader"
 version = "0.4.0"
 dependencies = [
+ "atom-sdk",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]
 name = "atom-tools-fs"
 version = "0.2.0"
 dependencies = [
+ "atom-sdk",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]
 name = "atom-tools-shell"
 version = "0.2.0"
 dependencies = [
+ "atom-sdk",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]
 name = "atom-ui-cli"
 version = "0.2.0"
 dependencies = [
+ "atom-sdk",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]
 name = "atom-ui-web"
 version = "0.8.0"
 dependencies = [
+ "atom-sdk",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]

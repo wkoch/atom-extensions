@@ -1,7 +1,14 @@
 //! `atom/ui-cli`: chat no terminal via `atom run chat`.
 //! Fala com o bus no stdin/stdout e com o terminal no socket `io`.
 //! Thread principal dirige tudo; feeders só empurram linhas para o canal.
+//! Protocolo via `atom-sdk` (`Declare`/`ProvidesEntry` no anúncio de
+//! `atom.initialize`, `ErrorCode`/`RpcError` nos erros): `ui.prompt@0` +
+//! comando `chat`. `command.run` é request de controle do host sem gancho no
+//! SDK fixado (o catch-all responderia `-32601` e o chat nunca abriria);
+//! por isso o loop manual dirige bus + `io` como antes, com os mesmos
+//! métodos, códigos e mensagens no fio.
 
+use atom_sdk::{Declare, ErrorCode, ProvidesEntry, RpcError};
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -9,6 +16,17 @@ use std::os::unix::net::UnixStream;
 enum Ev {
     Bus(Option<Value>),
     Tty(Option<String>),
+}
+
+/// Declaração da extensão (fonte única p/ o anúncio de `atom.initialize`).
+fn declare() -> Declare {
+    Declare {
+        provides: vec![ProvidesEntry {
+            contract: "ui.prompt@0".to_string(),
+            version: "0.1.0".to_string(),
+        }],
+        ..Default::default()
+    }
 }
 
 fn send(out: &mut std::io::Stdout, v: &Value) {
@@ -92,10 +110,16 @@ fn main() {
                     "atom.exit" => break,
                     "atom.initialize" => {
                         if let Some(i) = id {
+                            let d = declare();
+                            let provides: Vec<Value> = d
+                                .provides
+                                .iter()
+                                .map(|p| json!({"contract": p.contract, "version": p.version}))
+                                .collect();
                             send(
                                 &mut out,
                                 &json!({"jsonrpc": "2.0", "id": i, "result":
-                                {"protocol": "atom/1", "provides": [{"contract": "ui.prompt@0", "version": "0.1.0"}]}}),
+                                {"protocol": "atom/1", "provides": provides}}),
                             );
                         }
                     }
@@ -110,10 +134,14 @@ fn main() {
                         let p = params.get("params").cloned().unwrap_or(Value::Null);
                         if svc != "ui.prompt@0" {
                             if let Some(i) = id {
+                                let e = RpcError::new(
+                                    ErrorCode::METHOD_NOT_FOUND,
+                                    "contrato desconhecido",
+                                );
                                 send(
                                     &mut out,
                                     &json!({"jsonrpc": "2.0", "id": i,
-                                    "error": {"code": -32601, "message": "contrato desconhecido"}}),
+                                    "error": {"code": e.code, "message": e.message}}),
                                 );
                             }
                             continue;
@@ -166,10 +194,14 @@ fn main() {
                             }
                             _ => {
                                 if let Some(i) = id {
+                                    let e = RpcError::new(
+                                        ErrorCode::METHOD_NOT_FOUND,
+                                        format!("método {m} desconhecido"),
+                                    );
                                     send(
                                         &mut out,
                                         &json!({"jsonrpc": "2.0", "id": i,
-                                        "error": {"code": -32601, "message": format!("método {m} desconhecido")}}),
+                                        "error": {"code": e.code, "message": e.message}}),
                                     );
                                 }
                             }
@@ -255,10 +287,14 @@ fn main() {
                             }
                             Err(e) => {
                                 if let Some(i) = id {
+                                    let e = RpcError::new(
+                                        ErrorCode::INTERNAL_ERROR,
+                                        format!("io: {e}"),
+                                    );
                                     send(
                                         &mut out,
                                         &json!({"jsonrpc": "2.0", "id": i,
-                                        "error": {"code": -32603, "message": format!("io: {e}")}}),
+                                        "error": {"code": e.code, "message": e.message}}),
                                     );
                                 }
                                 break;
@@ -292,10 +328,14 @@ fn main() {
                     }
                     _ => {
                         if let Some(i) = id {
+                            let e = RpcError::new(
+                                ErrorCode::METHOD_NOT_FOUND,
+                                format!("método {method} desconhecido"),
+                            );
                             send(
                                 &mut out,
                                 &json!({"jsonrpc": "2.0", "id": i,
-                                "error": {"code": -32601, "message": format!("método {method} desconhecido")}}),
+                                "error": {"code": e.code, "message": e.message}}),
                             );
                         }
                     }

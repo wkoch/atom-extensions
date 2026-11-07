@@ -4,7 +4,7 @@ version = "0.1.0"
 kind = "contract"
 description = "Contrato ui.views@0: raiz ui.root (single, layout) + views ui.views (multi)"
 license = "MIT"
-engine = ">=0.1.0"
+engine = ">=0.1.0, <2.0.0"
 
 [contributes.contract]
 id = "ui.views@0"

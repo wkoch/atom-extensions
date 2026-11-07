@@ -18,8 +18,9 @@
    - `atom ext pack <dir> --key <publisher> --out-dir out/` por plataforma (ou uma vez, `any`);
    - anexa `.tar.gz` a uma GitHub Release com a tag;
    - abre PR no `atom-store` com `out/*.index.json` mesclado (`atom ext publish --store-dir v1 ...` sem chave da loja);
-   - (`store/v2`, quando o core tiver a ferramenta — `store-v2.md §8`) gera e assina o delegado `publisher:atom`
-     com versão incrementada sobre a última publicada e inclui no mesmo PR.
+   - `store/v2` (BLOQUEADO — E0.1; o core ainda não tem a ferramenta pub v2, `store-v2.md §8`):
+     quando existir, o mesmo job gera e assina o delegado `publisher:atom` com `ATOM_PUBLISHER_KEY`
+     (versão incrementada sobre a última publicada) e inclui no mesmo PR.
 5. Mantenedor da loja revisa e faz merge; CI da loja assina índice e regenera `catalog.json` (`v1`) e
    assina `targets`/`snapshot`/`timestamp` (`v2`).
 

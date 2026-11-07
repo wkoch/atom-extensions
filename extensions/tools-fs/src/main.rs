@@ -1,9 +1,11 @@
 //! `atom/tools-fs`: provê `ai.tools@0` com `fs_read`, `fs_write`, `fs_list`.
-//! Sem estado; operações síncronas no loop principal (rápidas).
+//! Sem estado; operações síncronas (rápidas).
 //! `shortcut: sem sandbox de paths (caps entram na v0.6); confie no chamador local.`
 
+use atom_sdk::{Client, Declare, Handler, Invoke, ProvidesEntry, RpcError};
 use serde_json::{Value, json};
-use std::io::{BufRead, Write};
+
+struct ToolsFs;
 
 fn tool_defs() -> Value {
     json!([
@@ -75,60 +77,38 @@ fn execute(name: &str, input: &Value) -> Value {
     }
 }
 
-fn main() {
-    let stdin = std::io::stdin();
-    let mut stdout = std::io::stdout();
-    for line in stdin.lock().lines() {
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => break,
-        };
-        if line.trim().is_empty() {
-            continue;
-        }
-        let req: Value = match serde_json::from_str(&line) {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("linha inválida: {e}");
-                continue;
-            }
-        };
-        let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
-        let id = req.get("id").cloned();
-        if method == "atom.exit" {
-            break;
-        }
-        let result = match method {
-            "atom.initialize" => Some(json!({
-                "protocol": "atom/1",
-                "provides": [{"contract": "ai.tools@0", "version": "0.1.0"}],
-            })),
-            "atom.shutdown" => Some(json!({})),
-            "service.invoke" => {
-                let p = req.get("params").cloned().unwrap_or(Value::Null);
-                let svc = p.get("service").and_then(|s| s.as_str()).unwrap_or("");
-                let m = p.get("method").and_then(|x| x.as_str()).unwrap_or("");
-                let ip = p.get("params").cloned().unwrap_or(Value::Null);
-                match (svc, m) {
-                    ("ai.tools@0", "list") => Some(tool_defs()),
-                    ("ai.tools@0", "execute") => {
-                        let n = ip.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                        let input = ip.get("input").cloned().unwrap_or(Value::Null);
-                        Some(execute(n, &input))
-                    }
-                    _ => None,
-                }
-            }
-            _ => None,
-        };
-        if id.is_some() {
-            let resp = match result {
-                Some(r) => json!({"jsonrpc": "2.0", "id": id, "result": r}),
-                None => json!({"jsonrpc": "2.0", "id": id,
-                    "error": {"code": -32601, "message": format!("método {method} desconhecido")}}),
-            };
-            writeln!(stdout, "{}", serde_json::to_string(&resp).unwrap()).unwrap();
-            stdout.flush().unwrap();
+impl Handler for ToolsFs {
+    fn declare(&self) -> Declare {
+        Declare {
+            provides: vec![ProvidesEntry {
+                contract: "ai.tools@0".to_string(),
+                version: "0.1.0".to_string(),
+            }],
+            ..Default::default()
         }
     }
+
+    async fn on_invoke(&self, _client: &Client, inv: Invoke) -> Result<Value, RpcError> {
+        match (inv.service.as_str(), inv.method.as_str()) {
+            ("ai.tools@0", "list") => Ok(tool_defs()),
+            ("ai.tools@0", "execute") => {
+                let n = inv
+                    .params
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let input = inv.params.get("input").cloned().unwrap_or(Value::Null);
+                Ok(execute(n, &input))
+            }
+            (s, m) => Err(RpcError::new(
+                atom_sdk::ErrorCode::METHOD_NOT_FOUND,
+                format!("método {s}/{m} desconhecido"),
+            )),
+        }
+    }
+}
+
+#[tokio::main]
+async fn main() {
+    atom_sdk::run(ToolsFs).await;
 }
