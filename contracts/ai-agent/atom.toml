@@ -4,7 +4,7 @@ version = "0.1.0"
 kind = "contract"
 description = "Contrato ai.agent@0: loop agente (harness)"
 license = "MIT"
-engine = ">=0.1.0"
+engine = ">=0.1.0, <2.0.0"
 
 [contributes.contract]
 id = "ai.agent@0"

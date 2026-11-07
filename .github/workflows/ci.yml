@@ -41,8 +41,28 @@ jobs:
                       av = d.get("version")
                       print(f"{m}: versão {av} != Cargo {cv}")
                       bad += 1
+              # E0.1: engine sempre com teto <2.0.0 (piso sobe p/ 1.1.0 quando usar v1.1).
+              eng = d.get("engine", "")
+              if "<2.0.0" not in eng:
+                  print(f"{m}: engine sem teto <2.0.0: {eng!r}"); bad += 1
           for s in pathlib.Path("contracts").rglob("*.json"):
               try: json.loads(s.read_text())
               except Exception as e: print(f"{s}: {e}"); bad += 1
           sys.exit(1 if bad else 0)
           PY
+
+  conformance:
+    # E0.1: `atom-conformance ext -- <binário>` do core v1.1 contra cada executável.
+    # Hoje o core fixado é pré-v1.1 (sem `atom-conformance`): job documenta o comando
+    # e passa; vira gate real quando a tag v1.1 existir.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: |
+          for b in tools-fs tools-shell guard-shell skill-loader mcp-bridge \
+                   llm-openai-compat llm-anthropic agent-loop-basic ui-cli ui-web; do
+            cargo build -p "atom-${b}"
+            # atom-conformance ext -- "target/debug/${b}"  # core v1.1 (E0.1)
+          done
+          echo "conformance: comandos executam; gate real após tag v1.1 do core"

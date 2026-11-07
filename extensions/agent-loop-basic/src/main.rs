@@ -1,10 +1,17 @@
 //! `atom/agent-loop-basic`: `ai.agent@0` em loop simples (llm ↔ tools).
-//! Single-thread, um `run` ativo por vez; resto é máquina de estados no stdin.
-//! Descobre tools via `atom.registry.list` + união dos `list` de cada provider.
+//! Um `run` ativo por vez; máquina de estados sobre o atom-sdk.
+//! O loop do `run` roda dentro do `on_invoke` (a resposta do invoke sai no
+//! fim, como no original manual); eventos ao vivo vão no stream do chamador.
+//! Só o `complete` do LLM usa `stream=true` — os chunks chegam em
+//! `on_stream_chunk/end` e são re-seriados no turno via canal interno.
 
+use atom_sdk::{
+    Client, Declare, ErrorCode, Handler, Invoke, ProvidesEntry, RpcError, StreamChunk, StreamEnd,
+};
 use serde_json::{Value, json};
 use std::collections::HashMap;
-use std::io::{BufRead, Write};
+use std::sync::Mutex;
+use tokio::sync::mpsc;
 
 #[derive(Default)]
 struct Cfg {
@@ -33,77 +40,57 @@ impl Cfg {
     }
 }
 
+#[derive(Clone)]
 struct Run {
     session: String,
     stream: Option<String>,
-    invoke_id: Value,
     history: Vec<Value>,
     /// tool → (provedor, definição completa do `list`).
     tools: HashMap<String, (String, Value)>,
     llm_stream: Option<String>,
-    pending_tool_calls: Vec<(String, String, Value)>,
-    /// tool_call em voo (call_id, nome) — resposta casa aqui.
-    inflight: Option<(String, String)>,
-    tool_acc: HashMap<String, (String, String)>,
     turns: u64,
     max_turns: u64,
     model: Option<String>,
     workdir: Option<String>,
     cancelled: bool,
     llm_target: Option<String>,
-    /// true até a união de tools terminar (sem turnos antes disso).
-    gathering: bool,
-    pending_lists: usize,
-    /// texto já repassado ao vivo neste turno (evita ecoar no fim).
-    streamed_text: bool,
-    /// mensagem final (a que vai no `done`).
-    final_message: Option<String>,
 }
 
-fn send(out: &mut std::io::Stdout, v: &Value) {
-    writeln!(out, "{}", serde_json::to_string(v).unwrap()).unwrap();
-    out.flush().unwrap();
+enum LlmEvent {
+    Chunk(Value),
+    End {
+        result: Option<Value>,
+        error: Option<RpcError>,
+    },
 }
 
-fn notif(method: &str, params: Value) -> Value {
-    json!({"jsonrpc": "2.0", "method": method, "params": params})
+#[derive(Default)]
+struct State {
+    sessions: HashMap<String, Vec<Value>>,
+    run: Option<Run>,
+    /// llm_stream → entrega de chunks/fim ao turno em espera.
+    llm_tx: HashMap<String, mpsc::UnboundedSender<LlmEvent>>,
+}
+
+#[derive(Default)]
+struct AgentLoop {
+    state: Mutex<State>,
+}
+
+async fn config_of(client: &Client) -> Cfg {
+    let v = client
+        .request("atom.config.get", json!({}))
+        .await
+        .unwrap_or(Value::Null);
+    Cfg::from(&v)
 }
 
 /// Emite evento do agente no próprio stream (só se o chamador pediu stream).
-fn emit(stdout: &mut std::io::Stdout, r: &Run, data: Value, seq: &mut u64) {
-    if let Some(s) = &r.stream {
+fn emit(client: &Client, stream: &Option<String>, seq: &mut u64, data: Value) {
+    if let Some(s) = stream {
         *seq += 1;
-        send(
-            stdout,
-            &notif(
-                "atom.stream.chunk",
-                json!({"stream": s, "seq": seq, "data": data}),
-            ),
-        );
+        client.stream_chunk(s, *seq, data);
     }
-}
-
-fn req(id: String, method: &str, params: Value) -> Value {
-    json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params})
-}
-
-fn bus_call(
-    stdout: &mut std::io::Stdout,
-    next: &mut u64,
-    svc: &str,
-    m: &str,
-    p: Value,
-    target: Option<&str>,
-    stream: bool,
-) -> String {
-    *next += 1;
-    let id = format!("agent-{next}");
-    let mut cp = json!({"service": svc, "method": m, "params": p, "stream": stream});
-    if let Some(t) = target {
-        cp["target"] = json!(t);
-    }
-    send(stdout, &req(id.clone(), "atom.call", cp));
-    id
 }
 
 fn system_text(workdir: &Option<String>) -> String {
@@ -115,459 +102,6 @@ fn system_text(workdir: &Option<String>) -> String {
         s.push_str(&format!(" Working directory: {w}."));
     }
     s
-}
-
-fn main() {
-    let stdin = std::io::stdin();
-    let mut stdout = std::io::stdout();
-    let mut stdin_lock = stdin.lock();
-    let mut cfg = Cfg::default();
-    let mut sessions: HashMap<String, Vec<Value>> = HashMap::new();
-    let mut next: u64 = 0;
-    let mut run: Option<Run> = None;
-    // pendentes de round-trip: id → ação.
-    let mut pending: HashMap<String, Value> = HashMap::new();
-
-    let mut seq = 0u64;
-    loop {
-        let mut line = String::new();
-        if stdin_lock.read_line(&mut line).unwrap_or(0) == 0 {
-            break;
-        }
-        if line.trim().is_empty() {
-            continue;
-        }
-        let v: Value = match serde_json::from_str(&line) {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("linha inválida: {e}");
-                continue;
-            }
-        };
-        let method = v
-            .get("method")
-            .and_then(|m| m.as_str())
-            .unwrap_or("")
-            .to_string();
-        let id = v.get("id").cloned();
-        let params = v.get("params").cloned().unwrap_or(Value::Null);
-
-        // Resposta a `atom.call` próprio?
-        if method.is_empty() && id.is_some() {
-            let rid = id.clone().unwrap().as_str().unwrap_or("").to_string();
-            if let Some(tag) = pending.remove(&rid) {
-                let result = v.get("result").cloned().unwrap_or(Value::Null);
-                if tag == "llm-immediate" {
-                    if let Some(r) = run.as_mut() {
-                        r.llm_stream = result
-                            .get("stream")
-                            .and_then(|s| s.as_str())
-                            .map(|s| s.to_string());
-                    }
-                    continue;
-                }
-                if tag == "registry" {
-                    // União de tools, dirigida a eventos (nunca bloqueia).
-                    let providers: Vec<String> = result
-                        .get("providers")
-                        .and_then(|x| x.get("ai.tools@0"))
-                        .and_then(|x| x.as_array())
-                        .cloned()
-                        .unwrap_or_default()
-                        .iter()
-                        .filter_map(|x| x.as_str().map(|s| s.to_string()))
-                        .collect();
-                    if let Some(r) = run.as_mut() {
-                        r.pending_lists = providers.len();
-                        for pn in providers {
-                            next += 1;
-                            let lid = format!("agent-{next}");
-                            pending.insert(lid.clone(), json!(format!("toolslist:{pn}")));
-                            let cp = json!({"service": "ai.tools@0", "method": "list", "params": {}, "stream": false, "target": pn});
-                            send(&mut stdout, &req(lid, "atom.call", cp));
-                        }
-                        if r.pending_lists == 0 {
-                            r.gathering = false;
-                            emit(
-                                &mut stdout,
-                                r,
-                                json!({"type": "status", "text": "pensando..."}),
-                                &mut seq,
-                            );
-                            start_turn(&mut stdout, r, &cfg, &mut next, &mut pending);
-                        }
-                    }
-                    continue;
-                }
-                if let Some(prov) = tag.as_str().and_then(|t| t.strip_prefix("toolslist:")) {
-                    let prov = prov.to_string();
-                    if let Some(r) = run.as_mut() {
-                        for d in result.as_array().cloned().unwrap_or_default() {
-                            if let Some(n) = d.get("name").and_then(|x| x.as_str()) {
-                                r.tools.entry(n.to_string()).or_insert((prov.clone(), d));
-                            }
-                        }
-                        if r.pending_lists > 0 {
-                            r.pending_lists -= 1;
-                        }
-                        if r.pending_lists == 0 && r.gathering {
-                            r.gathering = false;
-                            emit(
-                                &mut stdout,
-                                r,
-                                json!({"type": "status", "text": "pensando..."}),
-                                &mut seq,
-                            );
-                            start_turn(&mut stdout, r, &cfg, &mut next, &mut pending);
-                        }
-                    }
-                    continue;
-                }
-                if tag.as_str().map(|t| t.starts_with("tool:")) == Some(true) {
-                    if let Some(r) = run.as_mut() {
-                        let (call_id, name) = r.inflight.clone().unwrap_or_default();
-                        let text = text_of_result(&result);
-                        let is_error = result
-                            .get("is_error")
-                            .and_then(|x| x.as_bool())
-                            .unwrap_or(false);
-                        r.inflight = None;
-                        r.history.push(json!({"role": "tool", "content": [
-                            {"type": "tool_result", "tool_result": {"call_id": call_id, "content": text, "is_error": is_error}}
-                        ]}));
-                        emit(
-                            &mut stdout,
-                            r,
-                            json!({"type": "tool_result", "name": name, "output": text_of_result(&result), "is_error": is_error}),
-                            &mut seq,
-                        );
-                        // próxima tool da fila ou próximo turno
-                        if let Some((cid, name, input)) = r.pending_tool_calls.first().cloned() {
-                            r.pending_tool_calls.remove(0);
-                            fire_tool(
-                                &mut stdout,
-                                r,
-                                &mut next,
-                                &mut pending,
-                                &mut seq,
-                                (cid, name, input),
-                            );
-                        } else {
-                            start_turn(&mut stdout, r, &cfg, &mut next, &mut pending);
-                        }
-                    }
-                    continue;
-                }
-            }
-            continue;
-        }
-
-        match method.as_str() {
-            "atom.exit" => break,
-            "atom.initialize" => {
-                let c = params.get("config").cloned().unwrap_or(Value::Null);
-                cfg = Cfg::from(&c);
-                if let Some(i) = id {
-                    send(
-                        &mut stdout,
-                        &json!({"jsonrpc": "2.0", "id": i, "result":
-                        {"protocol": "atom/1", "provides": [{"contract": "ai.agent@0", "version": "0.1.0"}]}}),
-                    );
-                }
-            }
-            "atom.shutdown" => {
-                if let Some(i) = id {
-                    send(
-                        &mut stdout,
-                        &json!({"jsonrpc": "2.0", "id": i, "result": {}}),
-                    );
-                }
-            }
-            "atom.stream.cancel" => {
-                if let (Some(r), Some(s)) =
-                    (run.as_mut(), params.get("stream").and_then(|x| x.as_str()))
-                    && r.stream.as_deref() == Some(s)
-                {
-                    r.cancelled = true;
-                    if let Some(ls) = r.llm_stream.clone() {
-                        send(
-                            &mut stdout,
-                            &notif("atom.stream.cancel", json!({"stream": ls})),
-                        );
-                    } else {
-                        finish_cancelled(&mut stdout, &mut sessions, r, &mut seq);
-                        run = None;
-                    }
-                }
-            }
-            "atom.stream.chunk" => {
-                let s = params.get("stream").and_then(|x| x.as_str()).unwrap_or("");
-                let take = run.as_ref().and_then(|r| r.llm_stream.clone()).as_deref() == Some(s);
-                if take {
-                    let data = params.get("data").cloned().unwrap_or(Value::Null);
-                    if let Some(r) = run.as_mut() {
-                        if let Some(t) = data.get("delta_text").and_then(|x| x.as_str()) {
-                            r.streamed_text = true;
-                            emit(&mut stdout, r, json!({"type": "text", "text": t}), &mut seq);
-                        }
-                        if let Some(dt) = data.get("delta_tool_call") {
-                            let cid = dt
-                                .get("id")
-                                .and_then(|x| x.as_str())
-                                .unwrap_or("")
-                                .to_string();
-                            if !cid.is_empty() {
-                                let e = r
-                                    .tool_acc
-                                    .entry(cid.clone())
-                                    .or_insert((String::new(), String::new()));
-                                if let Some(n) = dt.get("name").and_then(|x| x.as_str())
-                                    && !n.is_empty()
-                                {
-                                    e.0 = n.to_string();
-                                }
-                                if let Some(f) = dt.get("input_delta").and_then(|x| x.as_str()) {
-                                    e.1.push_str(f);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            "atom.stream.end" => {
-                let s = params.get("stream").and_then(|x| x.as_str()).unwrap_or("");
-                let take = run.as_ref().and_then(|r| r.llm_stream.clone()).as_deref() == Some(s);
-                if !take {
-                    continue;
-                }
-                if let Some(err) = params.get("error") {
-                    if let Some(r) = run.as_mut() {
-                        emit(
-                            &mut stdout,
-                            r,
-                            json!({"type": "done", "message": format!("llm: {}", err.get("message").and_then(|x| x.as_str()).unwrap_or("erro"))}),
-                            &mut seq,
-                        );
-                        r.final_message = Some(format!(
-                            "llm: {}",
-                            err.get("message")
-                                .and_then(|x| x.as_str())
-                                .unwrap_or("erro")
-                        ));
-                        end_run(&mut stdout, &mut sessions, r, &mut seq, true);
-                    }
-                    run = None;
-                    continue;
-                }
-                let result = params.get("result").cloned().unwrap_or(Value::Null);
-                let msg = result.get("message").cloned().unwrap_or(Value::Null);
-                let parts = msg
-                    .get("content")
-                    .and_then(|c| c.as_array())
-                    .cloned()
-                    .unwrap_or_default();
-                let calls: Vec<(String, String, Value)> = parts
-                    .iter()
-                    .filter(|p| p.get("type").and_then(|t| t.as_str()) == Some("tool_call"))
-                    .map(|p| {
-                        let t = &p["tool_call"];
-                        (
-                            t.get("id")
-                                .and_then(|x| x.as_str())
-                                .unwrap_or("")
-                                .to_string(),
-                            t.get("name")
-                                .and_then(|x| x.as_str())
-                                .unwrap_or("")
-                                .to_string(),
-                            t.get("input").cloned().unwrap_or(Value::Null),
-                        )
-                    })
-                    .collect();
-                if let Some(r) = run.as_mut() {
-                    // texto final do turno (só se não foi repassado ao vivo)
-                    if !r.streamed_text {
-                        for p in &parts {
-                            if p.get("type").and_then(|t| t.as_str()) == Some("text")
-                                && let Some(t) = p.get("text").and_then(|x| x.as_str())
-                            {
-                                emit(&mut stdout, r, json!({"type": "text", "text": t}), &mut seq);
-                            }
-                        }
-                    }
-                    r.history.push(msg);
-                    r.llm_stream = None;
-                    r.tool_acc.clear();
-                    if r.cancelled {
-                        finish_cancelled(&mut stdout, &mut sessions, r, &mut seq);
-                        run = None;
-                        continue;
-                    }
-                    if calls.is_empty() {
-                        let text = text_of_parts(&parts);
-                        emit(
-                            &mut stdout,
-                            r,
-                            json!({"type": "done", "message": text.clone()}),
-                            &mut seq,
-                        );
-                        r.final_message = Some(text);
-                        end_run(&mut stdout, &mut sessions, r, &mut seq, false);
-                        run = None;
-                        continue;
-                    }
-                    if r.turns >= r.max_turns {
-                        emit(
-                            &mut stdout,
-                            r,
-                            json!({"type": "done", "message": "limite de turnos"}),
-                            &mut seq,
-                        );
-                        r.final_message = Some("limite de turnos".to_string());
-                        end_run(&mut stdout, &mut sessions, r, &mut seq, false);
-                        run = None;
-                        continue;
-                    }
-                    r.pending_tool_calls = calls;
-                    // dispara a primeira tool; as demais encadeiam nas respostas
-                    if let Some((cid, name, input)) = r.pending_tool_calls.first().cloned() {
-                        r.pending_tool_calls.remove(0);
-                        fire_tool(
-                            &mut stdout,
-                            r,
-                            &mut next,
-                            &mut pending,
-                            &mut seq,
-                            (cid, name, input),
-                        );
-                    }
-                }
-            }
-            "service.invoke" => {
-                let svc = params.get("service").and_then(|s| s.as_str()).unwrap_or("");
-                let m = params.get("method").and_then(|x| x.as_str()).unwrap_or("");
-                let ip = params.get("params").cloned().unwrap_or(Value::Null);
-                let stream = params
-                    .get("stream")
-                    .and_then(|s| s.as_str())
-                    .map(|s| s.to_string());
-                match (svc, m) {
-                    ("ai.agent@0", "sessions.list") => {
-                        if let Some(i) = id {
-                            let names: Vec<String> = sessions.keys().cloned().collect();
-                            send(
-                                &mut stdout,
-                                &json!({"jsonrpc": "2.0", "id": i, "result": names}),
-                            );
-                        }
-                    }
-                    ("ai.agent@0", "sessions.get") => {
-                        if let Some(i) = id {
-                            let s = ip.get("session").and_then(|x| x.as_str()).unwrap_or("");
-                            let turns = sessions.get(s).cloned().unwrap_or_default();
-                            send(
-                                &mut stdout,
-                                &json!({"jsonrpc": "2.0", "id": i,
-                                "result": {"session": s, "turns": turns}}),
-                            );
-                        }
-                    }
-                    ("ai.agent@0", "sessions.delete") => {
-                        if let Some(i) = id {
-                            let s = ip.get("session").and_then(|x| x.as_str()).unwrap_or("");
-                            let had = sessions.remove(s).is_some();
-                            send(
-                                &mut stdout,
-                                &json!({"jsonrpc": "2.0", "id": i, "result": {"deleted": had}}),
-                            );
-                        }
-                    }
-                    ("ai.agent@0", "run") => {
-                        if run.is_some() {
-                            if let Some(i) = id {
-                                send(
-                                    &mut stdout,
-                                    &json!({"jsonrpc": "2.0", "id": i,
-                                    "error": {"code": -32603, "message": "run já em andamento"}}),
-                                );
-                            }
-                            continue;
-                        }
-                        let session = ip
-                            .get("session")
-                            .and_then(|x| x.as_str())
-                            .unwrap_or("chat")
-                            .to_string();
-                        let input = ip
-                            .get("input")
-                            .and_then(|x| x.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        let opts = ip.get("options").cloned().unwrap_or(Value::Null);
-                        let mut history = sessions.get(&session).cloned().unwrap_or_default();
-                        history.push(
-                            json!({"role": "user", "content": [{"type": "text", "text": input}]}),
-                        );
-                        let workdir = opts
-                            .get("workdir")
-                            .and_then(|x| x.as_str())
-                            .map(|s| s.to_string());
-                        run = Some(Run {
-                            session,
-                            stream,
-                            invoke_id: id.clone().unwrap_or(Value::Null),
-                            history,
-                            tools: HashMap::new(),
-                            llm_stream: None,
-                            pending_tool_calls: vec![],
-                            inflight: None,
-                            tool_acc: HashMap::new(),
-                            turns: 0,
-                            max_turns: opts
-                                .get("max_turns")
-                                .and_then(|x| x.as_u64())
-                                .unwrap_or(cfg.max_turns),
-                            model: opts
-                                .get("model")
-                                .and_then(|x| x.as_str())
-                                .map(|s| s.to_string())
-                                .or_else(|| cfg.model.clone()),
-                            workdir,
-                            cancelled: false,
-                            llm_target: cfg.llm_target.clone(),
-                            gathering: true,
-                            pending_lists: 0,
-                            streamed_text: false,
-                            final_message: None,
-                        });
-                        // União de tools dirigida a eventos (nunca bloqueia o stdin).
-                        next += 1;
-                        let rid = format!("agent-{next}");
-                        pending.insert(rid.clone(), json!("registry"));
-                        send(&mut stdout, &req(rid, "atom.registry.list", json!({})));
-                    }
-                    _ => {
-                        if let Some(i) = id {
-                            send(
-                                &mut stdout,
-                                &json!({"jsonrpc": "2.0", "id": i,
-                                "error": {"code": -32601, "message": format!("método {svc}/{m} desconhecido")}}),
-                            );
-                        }
-                    }
-                }
-            }
-            _ => {
-                if let Some(i) = id {
-                    send(
-                        &mut stdout,
-                        &json!({"jsonrpc": "2.0", "id": i,
-                        "error": {"code": -32601, "message": format!("método {method} desconhecido")}}),
-                    );
-                }
-            }
-        }
-    }
 }
 
 fn text_of_parts(parts: &[Value]) -> String {
@@ -607,133 +141,561 @@ fn absolutize(input: &mut Value, workdir: &Option<String>) {
     }
 }
 
-/// Dispara um turno no LLM (stream sempre; quem não pediu stream ignora chunks).
-/// Dispara uma tool_call (emite evento, absolutiza path, registra inflight).
-fn fire_tool(
-    stdout: &mut std::io::Stdout,
-    r: &mut Run,
-    next: &mut u64,
-    pending: &mut HashMap<String, Value>,
-    seq: &mut u64,
-    call: (String, String, Value),
-) {
-    let (cid, name, input) = call;
-    emit(
-        stdout,
-        r,
-        json!({"type": "tool_call", "name": name, "input": input}),
-        seq,
-    );
-    let prov = r.tools.get(&name).map(|(p, _)| p.clone());
-    let mut call_input = input;
-    absolutize(&mut call_input, &r.workdir);
-    let cp = json!({"name": name, "input": call_input});
-    let tid = bus_call(
-        stdout,
-        next,
-        "ai.tools@0",
-        "execute",
-        cp,
-        prov.as_deref(),
-        false,
-    );
-    pending.insert(tid, json!("tool:exec"));
-    r.inflight = Some((cid, name));
-}
+impl AgentLoop {
+    fn is_cancelled(&self) -> bool {
+        self.state
+            .lock()
+            .map(|st| st.run.as_ref().is_some_and(|r| r.cancelled))
+            .unwrap_or(false)
+    }
 
-fn start_turn(
-    stdout: &mut std::io::Stdout,
-    r: &mut Run,
-    _cfg: &Cfg,
-    next: &mut u64,
-    pending: &mut HashMap<String, Value>,
-) {
-    r.turns += 1;
-    r.llm_stream = None;
-    r.tool_acc.clear();
-    r.streamed_text = false;
-    let mut messages = vec![
-        json!({"role": "system", "content": [{"type": "text", "text": system_text(&r.workdir)}]}),
-    ];
-    messages.extend(r.history.clone());
-    let mut p = json!({"messages": messages});
-    if let Some(m) = &r.model {
-        p["model"] = json!(m);
+    fn take_run(&self) -> Option<Run> {
+        self.state.lock().ok().and_then(|mut st| st.run.take())
     }
-    // tools no formato neutro do contrato (definições reais da união).
-    let defs: Vec<Value> = r.tools.values().map(|(_, d)| d.clone()).collect();
-    if !defs.is_empty() {
-        p["tools"] = Value::Array(defs);
-    }
-    let mut cp = json!({"service": "ai.llm@0", "method": "complete", "params": p, "stream": true});
-    if let Some(t) = &r.llm_target {
-        cp["target"] = json!(t);
-    }
-    *next += 1;
-    let id = format!("agent-{next}");
-    pending.insert(id.clone(), json!("llm-immediate"));
-    send(stdout, &req(id, "atom.call", cp));
-}
 
-fn end_run(
-    stdout: &mut std::io::Stdout,
-    sessions: &mut HashMap<String, Vec<Value>>,
-    r: &mut Run,
-    seq: &mut u64,
-    failed: bool,
-) {
-    sessions.insert(r.session.clone(), r.history.clone());
-    let text = r.final_message.clone().unwrap_or_default();
-    if let Some(s) = &r.stream {
-        let payload = if failed {
-            json!({"error": {"code": -32603, "message": text}})
+    /// Checkpoint de cancelamento: finaliza como cancelado se sinalizado.
+    fn cancelled_err(&self, client: &Client) -> Option<RpcError> {
+        if self.is_cancelled() {
+            match self.take_run() {
+                Some(run) => Some(self.finish_cancelled(client, run)),
+                None => Some(RpcError::new(ErrorCode::REQUEST_CANCELLED, "cancelado")),
+            }
         } else {
-            json!({"result": {"message": text}})
-        };
-        let mut obj = serde_json::Map::new();
-        obj.insert("stream".to_string(), json!(s));
-        if failed {
-            obj.insert("error".to_string(), payload["error"].clone());
-        } else {
-            obj.insert("result".to_string(), payload["result"].clone());
+            None
         }
-        send(stdout, &notif("atom.stream.end", Value::Object(obj)));
     }
-    if failed {
-        send(
-            stdout,
-            &json!({"jsonrpc": "2.0", "id": r.invoke_id,
-                "error": {"code": -32603, "message": text}}),
-        );
-    } else {
-        send(
-            stdout,
-            &json!({"jsonrpc": "2.0", "id": r.invoke_id, "result": {"message": text}}),
-        );
+
+    fn persist(&self, run: &Run) {
+        if let Ok(mut st) = self.state.lock() {
+            st.sessions.insert(run.session.clone(), run.history.clone());
+        }
     }
-    let _ = seq;
+
+    fn finish_ok(&self, client: &Client, run: Run, text: String) -> Value {
+        self.persist(&run);
+        if let Some(s) = &run.stream {
+            client.stream_end(s, json!({"message": text}));
+        }
+        json!({"message": text})
+    }
+
+    fn finish_failed(&self, client: &Client, run: Run, text: String) -> RpcError {
+        self.persist(&run);
+        if let Some(s) = &run.stream {
+            client.stream_error(s, RpcError::new(ErrorCode::INTERNAL_ERROR, text.clone()));
+        }
+        RpcError::new(ErrorCode::INTERNAL_ERROR, text)
+    }
+
+    fn finish_cancelled(&self, client: &Client, run: Run) -> RpcError {
+        self.persist(&run);
+        if let Some(s) = &run.stream {
+            client.stream_error(s, RpcError::new(ErrorCode::REQUEST_CANCELLED, "cancelado"));
+        }
+        RpcError::new(ErrorCode::REQUEST_CANCELLED, "cancelado")
+    }
+
+    fn fail_take(&self, client: &Client, text: String) -> RpcError {
+        match self.take_run() {
+            Some(run) => self.finish_failed(client, run, text),
+            None => RpcError::new(ErrorCode::INTERNAL_ERROR, text),
+        }
+    }
+
+    /// Loop do `run`: união de tools + turnos llm ↔ tools até stop.
+    /// Roda dentro do `on_invoke`; a resposta do invoke sai no retorno,
+    /// como o `end_run`/`finish_cancelled` do original.
+    async fn drive_run(&self, client: &Client) -> Result<Value, RpcError> {
+        let mut seq = 0u64;
+        // União de tools (sequencial; o original era dirigido a eventos).
+        let reg = client
+            .request("atom.registry.list", json!({}))
+            .await
+            .unwrap_or(Value::Null);
+        let providers: Vec<String> = reg
+            .get("providers")
+            .and_then(|x| x.get("ai.tools@0"))
+            .and_then(|x| x.as_array())
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|x| x.as_str().map(|s| s.to_string()))
+            .collect();
+        let mut tools: HashMap<String, (String, Value)> = HashMap::new();
+        for pn in providers {
+            if let Some(e) = self.cancelled_err(client) {
+                return Err(e);
+            }
+            let defs = client
+                .call("ai.tools@0", "list", json!({}), Some(&pn), false)
+                .await
+                .unwrap_or(Value::Null);
+            for d in defs.as_array().cloned().unwrap_or_default() {
+                if let Some(n) = d.get("name").and_then(|x| x.as_str()) {
+                    tools.entry(n.to_string()).or_insert((pn.clone(), d));
+                }
+            }
+        }
+        let snap0: Option<Run> = self.state.lock().ok().and_then(|mut st| {
+            st.run.as_mut().map(|r| {
+                r.tools = tools;
+                r.clone()
+            })
+        });
+        let Some(stream0) = snap0.map(|r| r.stream.clone()) else {
+            return Err(RpcError::new(ErrorCode::INTERNAL_ERROR, "run perdido"));
+        };
+        emit(
+            client,
+            &stream0,
+            &mut seq,
+            json!({"type": "status", "text": "pensando..."}),
+        );
+
+        loop {
+            if let Some(e) = self.cancelled_err(client) {
+                return Err(e);
+            }
+            // Foto do turno + conta (era o `start_turn`).
+            let snap: Run = match self.state.lock().ok().and_then(|mut st| {
+                st.run.as_mut().map(|r| {
+                    r.turns += 1;
+                    r.clone()
+                })
+            }) {
+                Some(r) => r,
+                None => {
+                    return Err(RpcError::new(ErrorCode::INTERNAL_ERROR, "run perdido"));
+                }
+            };
+            let mut messages = vec![
+                json!({"role": "system", "content": [{"type": "text", "text": system_text(&snap.workdir)}]}),
+            ];
+            messages.extend(snap.history.clone());
+            let mut p = json!({"messages": messages});
+            if let Some(m) = &snap.model {
+                p["model"] = json!(m);
+            }
+            // tools no formato neutro do contrato (definições reais da união).
+            let defs: Vec<Value> = snap.tools.values().map(|(_, d)| d.clone()).collect();
+            if !defs.is_empty() {
+                p["tools"] = Value::Array(defs);
+            }
+            let imm = match client
+                .call("ai.llm@0", "complete", p, snap.llm_target.as_deref(), true)
+                .await
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    let text = format!("llm: {e}");
+                    emit(
+                        client,
+                        &snap.stream,
+                        &mut seq,
+                        json!({"type": "done", "message": text}),
+                    );
+                    return Err(self.fail_take(client, text));
+                }
+            };
+            let ls = imm
+                .get("stream")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
+            if ls.is_empty() {
+                let text = "llm: resposta sem stream".to_string();
+                emit(
+                    client,
+                    &snap.stream,
+                    &mut seq,
+                    json!({"type": "done", "message": text}),
+                );
+                return Err(self.fail_take(client, text));
+            }
+            let (tx, mut rx) = mpsc::unbounded_channel::<LlmEvent>();
+            if let Ok(mut st) = self.state.lock() {
+                if let Some(r) = st.run.as_mut() {
+                    r.llm_stream = Some(ls.clone());
+                }
+                st.llm_tx.insert(ls.clone(), tx);
+            }
+            // Turno: acumula deltas (eco ao vivo) até o fim do stream do LLM.
+            let mut streamed_text = false;
+            let mut tool_acc: HashMap<String, (String, String)> = HashMap::new();
+            let (result, llm_error) = loop {
+                match rx.recv().await {
+                    Some(LlmEvent::Chunk(data)) => {
+                        if let Some(t) = data.get("delta_text").and_then(|x| x.as_str()) {
+                            streamed_text = true;
+                            emit(
+                                client,
+                                &snap.stream,
+                                &mut seq,
+                                json!({"type": "text", "text": t}),
+                            );
+                        }
+                        if let Some(dt) = data.get("delta_tool_call") {
+                            let cid = dt
+                                .get("id")
+                                .and_then(|x| x.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            if !cid.is_empty() {
+                                let e = tool_acc
+                                    .entry(cid)
+                                    .or_insert((String::new(), String::new()));
+                                if let Some(n) = dt.get("name").and_then(|x| x.as_str())
+                                    && !n.is_empty()
+                                {
+                                    e.0 = n.to_string();
+                                }
+                                if let Some(f) = dt.get("input_delta").and_then(|x| x.as_str()) {
+                                    e.1.push_str(f);
+                                }
+                            }
+                        }
+                    }
+                    Some(LlmEvent::End { result, error }) => break (result, error),
+                    None => {
+                        break (
+                            None,
+                            Some(RpcError::new(
+                                ErrorCode::INTERNAL_ERROR,
+                                "llm: stream interrompido",
+                            )),
+                        );
+                    }
+                }
+            };
+            if let Ok(mut st) = self.state.lock() {
+                if let Some(r) = st.run.as_mut() {
+                    r.llm_stream = None;
+                }
+                st.llm_tx.remove(&ls);
+            }
+            let _ = tool_acc;
+            if let Some(e) = self.cancelled_err(client) {
+                return Err(e);
+            }
+            if let Some(err) = llm_error {
+                let text = format!("llm: {}", err.message);
+                emit(
+                    client,
+                    &snap.stream,
+                    &mut seq,
+                    json!({"type": "done", "message": text}),
+                );
+                return Err(self.fail_take(client, text));
+            }
+            let msg = result
+                .as_ref()
+                .and_then(|r| r.get("message"))
+                .cloned()
+                .unwrap_or(Value::Null);
+            let parts = msg
+                .get("content")
+                .and_then(|c| c.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let calls: Vec<(String, String, Value)> = parts
+                .iter()
+                .filter(|p| p.get("type").and_then(|t| t.as_str()) == Some("tool_call"))
+                .map(|p| {
+                    let t = &p["tool_call"];
+                    (
+                        t.get("id")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        t.get("name")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        t.get("input").cloned().unwrap_or(Value::Null),
+                    )
+                })
+                .collect();
+            // texto final do turno (só se não foi repassado ao vivo)
+            if !streamed_text {
+                for q in &parts {
+                    if q.get("type").and_then(|t| t.as_str()) == Some("text")
+                        && let Some(t) = q.get("text").and_then(|x| x.as_str())
+                    {
+                        emit(
+                            client,
+                            &snap.stream,
+                            &mut seq,
+                            json!({"type": "text", "text": t}),
+                        );
+                    }
+                }
+            }
+            if let Ok(mut st) = self.state.lock()
+                && let Some(r) = st.run.as_mut()
+            {
+                r.history.push(msg);
+            }
+            if let Some(e) = self.cancelled_err(client) {
+                return Err(e);
+            }
+            if calls.is_empty() {
+                let text = text_of_parts(&parts);
+                emit(
+                    client,
+                    &snap.stream,
+                    &mut seq,
+                    json!({"type": "done", "message": text}),
+                );
+                return match self.take_run() {
+                    Some(run) => Ok(self.finish_ok(client, run, text)),
+                    None => Ok(json!({"message": text})),
+                };
+            }
+            let (turns, max_turns) = self
+                .state
+                .lock()
+                .map(|st| {
+                    st.run
+                        .as_ref()
+                        .map(|r| (r.turns, r.max_turns))
+                        .unwrap_or((0, 0))
+                })
+                .unwrap_or((0, 0));
+            if turns >= max_turns {
+                let text = "limite de turnos".to_string();
+                emit(
+                    client,
+                    &snap.stream,
+                    &mut seq,
+                    json!({"type": "done", "message": text}),
+                );
+                return match self.take_run() {
+                    Some(run) => Ok(self.finish_ok(client, run, text)),
+                    None => Ok(json!({"message": text})),
+                };
+            }
+            // dispara as tools em sequência (era `fire_tool` + encadeamento).
+            for (cid, name, input) in calls {
+                if let Some(e) = self.cancelled_err(client) {
+                    return Err(e);
+                }
+                let (prov, workdir, stream) = self
+                    .state
+                    .lock()
+                    .map(|st| {
+                        st.run.as_ref().map(|r| {
+                            (
+                                r.tools.get(&name).map(|(p, _)| p.clone()),
+                                r.workdir.clone(),
+                                r.stream.clone(),
+                            )
+                        })
+                    })
+                    .unwrap_or(None)
+                    .unwrap_or((None, None, None));
+                emit(
+                    client,
+                    &stream,
+                    &mut seq,
+                    json!({"type": "tool_call", "name": name, "input": input}),
+                );
+                let mut call_input = input;
+                absolutize(&mut call_input, &workdir);
+                let cp = json!({"name": name, "input": call_input});
+                let res = client
+                    .call("ai.tools@0", "execute", cp, prov.as_deref(), false)
+                    .await
+                    .unwrap_or(Value::Null);
+                let text = text_of_result(&res);
+                let is_error = res
+                    .get("is_error")
+                    .and_then(|x| x.as_bool())
+                    .unwrap_or(false);
+                if let Ok(mut st) = self.state.lock()
+                    && let Some(r) = st.run.as_mut()
+                {
+                    r.history.push(json!({"role": "tool", "content": [
+                        {"type": "tool_result", "tool_result": {"call_id": cid, "content": text, "is_error": is_error}}
+                    ]}));
+                }
+                emit(
+                    client,
+                    &stream,
+                    &mut seq,
+                    json!({"type": "tool_result", "name": name, "output": text, "is_error": is_error}),
+                );
+            }
+        }
+    }
 }
 
-fn finish_cancelled(
-    stdout: &mut std::io::Stdout,
-    sessions: &mut HashMap<String, Vec<Value>>,
-    r: &mut Run,
-    seq: &mut u64,
-) {
-    sessions.insert(r.session.clone(), r.history.clone());
-    if let Some(s) = &r.stream {
-        let mut obj = serde_json::Map::new();
-        obj.insert("stream".to_string(), json!(s));
-        obj.insert(
-            "error".to_string(),
-            json!({"code": -32800, "message": "cancelado"}),
-        );
-        send(stdout, &notif("atom.stream.end", Value::Object(obj)));
+impl Handler for AgentLoop {
+    fn declare(&self) -> Declare {
+        Declare {
+            provides: vec![ProvidesEntry {
+                contract: "ai.agent@0".to_string(),
+                version: "0.1.0".to_string(),
+            }],
+            ..Default::default()
+        }
     }
-    send(
-        stdout,
-        &json!({"jsonrpc": "2.0", "id": r.invoke_id,
-            "error": {"code": -32800, "message": "cancelado"}}),
-    );
-    let _ = seq;
+
+    async fn on_invoke(&self, client: &Client, inv: Invoke) -> Result<Value, RpcError> {
+        match (inv.service.as_str(), inv.method.as_str()) {
+            ("ai.agent@0", "sessions.list") => {
+                let names: Vec<Value> = self
+                    .state
+                    .lock()
+                    .map(|st| {
+                        st.sessions
+                            .keys()
+                            .map(|s| Value::String(s.clone()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                Ok(Value::Array(names))
+            }
+            ("ai.agent@0", "sessions.get") => {
+                let s = inv
+                    .params
+                    .get("session")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("");
+                let turns = self
+                    .state
+                    .lock()
+                    .map(|st| st.sessions.get(s).cloned().unwrap_or_default())
+                    .unwrap_or_default();
+                Ok(json!({"session": s, "turns": turns}))
+            }
+            ("ai.agent@0", "sessions.delete") => {
+                let s = inv
+                    .params
+                    .get("session")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("");
+                let had = self
+                    .state
+                    .lock()
+                    .map(|mut st| st.sessions.remove(s).is_some())
+                    .unwrap_or(false);
+                Ok(json!({"deleted": had}))
+            }
+            ("ai.agent@0", "run") => {
+                let cfg = config_of(client).await;
+                let session = inv
+                    .params
+                    .get("session")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("chat")
+                    .to_string();
+                let input = inv
+                    .params
+                    .get("input")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let opts = inv.params.get("options").cloned().unwrap_or(Value::Null);
+                {
+                    let mut st = match self.state.lock() {
+                        Ok(g) => g,
+                        Err(_) => {
+                            return Err(RpcError::new(ErrorCode::INTERNAL_ERROR, "estado travado"));
+                        }
+                    };
+                    if st.run.is_some() {
+                        return Err(RpcError::new(
+                            ErrorCode::INTERNAL_ERROR,
+                            "run já em andamento",
+                        ));
+                    }
+                    let mut history = st.sessions.get(&session).cloned().unwrap_or_default();
+                    history.push(
+                        json!({"role": "user", "content": [{"type": "text", "text": input}]}),
+                    );
+                    st.run = Some(Run {
+                        session,
+                        stream: inv.stream.clone(),
+                        history,
+                        tools: HashMap::new(),
+                        llm_stream: None,
+                        turns: 0,
+                        max_turns: opts
+                            .get("max_turns")
+                            .and_then(|x| x.as_u64())
+                            .unwrap_or(cfg.max_turns),
+                        model: opts
+                            .get("model")
+                            .and_then(|x| x.as_str())
+                            .map(|s| s.to_string())
+                            .or(cfg.model),
+                        workdir: opts
+                            .get("workdir")
+                            .and_then(|x| x.as_str())
+                            .map(|s| s.to_string()),
+                        cancelled: false,
+                        llm_target: cfg.llm_target,
+                    });
+                }
+                self.drive_run(client).await
+            }
+            _ => Err(RpcError::new(
+                ErrorCode::METHOD_NOT_FOUND,
+                format!("método {}/{} desconhecido", inv.service, inv.method),
+            )),
+        }
+    }
+
+    async fn on_stream_chunk(&self, _client: &Client, chunk: StreamChunk) {
+        let tx = self
+            .state
+            .lock()
+            .ok()
+            .and_then(|st| st.llm_tx.get(&chunk.stream).cloned());
+        if let Some(tx) = tx {
+            let _ = tx.send(LlmEvent::Chunk(chunk.data));
+        }
+    }
+
+    async fn on_stream_end(&self, _client: &Client, end: StreamEnd) {
+        let tx = self
+            .state
+            .lock()
+            .ok()
+            .and_then(|mut st| st.llm_tx.remove(&end.stream));
+        if let Some(tx) = tx {
+            let _ = tx.send(LlmEvent::End {
+                result: end.result,
+                error: end.error,
+            });
+        }
+    }
+
+    async fn on_stream_cancel(&self, client: &Client, stream: &str) {
+        let ls = self
+            .state
+            .lock()
+            .ok()
+            .and_then(|mut st| match st.run.as_mut() {
+                Some(r) if r.stream.as_deref() == Some(stream) => {
+                    r.cancelled = true;
+                    // Limpa antes de repassar: chunks/end atrasados do LLM
+                    // são ignorados (sem virar turno nem fim de run).
+                    let ls = r.llm_stream.take();
+                    if let Some(ls) = &ls {
+                        st.llm_tx.remove(ls);
+                    }
+                    ls
+                }
+                _ => None,
+            });
+        if let Some(ls) = ls {
+            client.stream_cancel(&ls);
+        }
+    }
+}
+
+#[tokio::main]
+async fn main() {
+    atom_sdk::run(AgentLoop::default()).await;
 }

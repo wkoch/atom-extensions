@@ -10,6 +10,11 @@ members = [
   "extensions/tools-shell",
   "extensions/ui-cli",
   "extensions/ui-web",
+  "tests/e2e-core",
+  "testdata/echo",
+  "testdata/fake-llm",
+  "testdata/mcp-fake",
+  "testdata/prompt-fake",
 ]
 resolver = "2"
 
@@ -19,7 +24,9 @@ rust-version = "1.89.0"
 license = "MIT"
 
 [workspace.dependencies]
-# Depender do SDK por versão/tag, nunca por path (prova que terceiros conseguem).
-# Ajuste a URL quando o repo `atom` estiver no GitHub.
-# atom-sdk = { git = "https://github.com/wkoch/atom", tag = "v1.0.0" }
+# Core v1.1 tagueado (`atom-sdk`, `atom-core`, `atom-protocol` juntos).
+atom-sdk = { git = "https://github.com/wkoch/atom", tag = "v1.1" }
+atom-core = { git = "https://github.com/wkoch/atom", tag = "v1.1" }
+atom-protocol = { git = "https://github.com/wkoch/atom", tag = "v1.1" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "io-std", "net", "sync", "time", "signal", "fs"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }

@@ -15,7 +15,7 @@ version = "0.1.0"
 kind = "extension"
 description = "Eco com cumprimento"
 license = "MIT"
-engine = ">=0.1.0"
+engine = ">=1.1.0, <2.0.0"          # v1.1: cancelamento, deadline, fluxo; ">=1.0.0" se não usar
 protocol = "atom/1"
 entrypoint = "bin/hello"
 activation = ["onService:test.hello@0"]
@@ -25,7 +25,7 @@ contract = "test.hello@0"
 version = "0.1.0"
 ```
 
-Implemente com o SDK (`crates/atom-sdk`; mesma cobertura no TS em `sdks/atom-ts`):
+Implemente com o SDK (`atom-sdk`, do repo `atom`, por tag — nunca `path`; mesma cobertura no TS em `@atom/sdk`, `sdks/atom-ts` no repo `atom`):
 
 ```rust
 struct Hello;
@@ -57,14 +57,32 @@ atom call test.hello@0 ola '"mundo"'
 O SDK cuida de handshake, `service.invoke`, streams, interceptors e
 eventos; `client.call("ai.llm@0", ...)` chama outros serviços e
 `client.publish(...)` emite eventos. Ver `testdata/echo` (espelho mínimo)
-e `sdks/atom-ts/examples/echo.ts`.
+e `sdks/atom-ts/examples/echo.ts` (repo `atom`).
+
+### O que o core v1.1 espera de uma extensão
+
+- **Cancelamento:** o core repassa `$/cancelRequest` com o id do seu `service.invoke` (`[P-CANCEL-2]`) e
+  `atom.stream.cancel` para streams. Pare o trabalho e responda `-32800`; se não responder em 2s o core responde
+  por você e descarta sua resposta (`[P-CANCEL-3]`). (O SDK ainda não expõe `$/cancelRequest` ao `on_invoke`;
+  pendente no core.)
+- **Prazo:** `inv.deadline_ms()` traz `$ctx.deadline`. Para a sub-chamada herdar o prazo, use
+  `client.call_in_ctx(service, method, params, target, stream, Some(&inv.ctx))` (ou `call_with_deadline`); `client.call` simples não propaga. Estouro chega
+  como `-32022`.
+- **Streams:** nunca descarte chunks; `seq` começa em 0 e é contíguo. Produtor de stream longo pode declarar
+  `Declare { flow: Some("credit".into()), .. }` e respeitar `on_stream_credit` (`[P-STREAM-3]`). Consumidor pode usar
+  `client.call_with_window(...)` (`[P-STREAM-2]`).
+- **Eventos:** `client.subscribe_from(...)` retoma de `{epoch, offset}`; trate `on_events_gap` (ADR-022).
+- **KV:** `set` com `if_version`/`if_absent` evita perder escrita concorrente (`-32041`); `client.storage_watch(prefix)`
+  + `on_storage_changed` (ADR-023).
+- **Proibido:** conectar no socket do daemon (descendente recebe `-32005`, ADR-019) e editar `profile.toml`/`grants.toml`
+  (o core ignora e emite `atom.*.tampered`).
 
 ## 2. Prover um contrato
 
 Contratos são pacotes `kind = "contract"` com schemas (`specs/contracts.md`).
 Para prover um existente, declare `[[provides]]` (como acima) — o core
 valida params/resposta contra o schema quando instalado (`-32013` se violar).
-Para criar um contrato novo, copie `extensions/contracts/ai-llm/atom.toml`
+Para criar um contrato novo, copie `contracts/ai-llm/atom.toml`
 e escreva `schemas/seu.json`; versione `nome@major` (quebras só em major novo).
 
 ## 3. Kind handler (categoria nova sem mexer no core)
@@ -105,6 +123,8 @@ Exemplo: `extensions/guard-shell`.
 
 Declare no manifesto o que a extensão usa (`capabilities.md`); o instalador
 pede aprovação (`grants`) — sem grant, a chamada falha com `-32003`.
+`fs.*`, `net`, `exec` e `ui.serve` são *advisory*: o core não bloqueia, e a tela de aprovação diz isso
+(`[C-UI-1]`). Declare mesmo assim — é o que o usuário aprova.
 Config do usuário chega em `atom.initialize` e muda via `atom.config.changed`;
 valide com `config_schema` (ver `extensions/tools-fs/atom.toml`).
 
@@ -118,12 +138,16 @@ atom source add minha file:///caminho/v1/ --keys ed25519:...
 atom ext install voce/hello
 ```
 
+Loja `store/v2` (TUF, core v1.1): a source é adicionada com o sha256 do `1.root.json`
+(`atom source add oficial <url>/v2/ --root <sha256>`); a publicação v2 ainda depende de ferramenta do core
+(`atom-store/docs/store-v2.md §8`).
+
 Para um perfil pronto: escreva um pacote `kind = "distribution"`
 (ver `distributions/code-starter/atom.toml`) e crie com
 `sources` da loja primeiro (sources são por perfil):
 
 ```sh
-ATOM_PROFILE=code atom source add oficial <url> --keys ed25519:...
+ATOM_PROFILE=code atom source add oficial <url>/v1/ --keys ed25519:...   # ou <url>/v2/ --root <sha256>
 atom profile create code --from atom/code-starter
 ```
 

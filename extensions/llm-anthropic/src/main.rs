@@ -1,14 +1,21 @@
 //! `atom/llm-anthropic`: `ai.llm@0` sobre a API Anthropic (SSE).
-//! Mesmo esqueleto do `llm-openai-compat`: thread principal + worker por stream.
+//! Mesmo esqueleto do `llm-openai-compat`: `complete` com stream roda o HTTP
+//! bloqueante em `spawn_blocking` e emite `atom.stream.*` entre chunks.
 
+use atom_sdk::{Client, Declare, ErrorCode, Handler, Invoke, ProvidesEntry, RpcError};
 use serde_json::{Value, json};
 use std::collections::HashMap;
-use std::io::{BufRead, Write};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
 };
 
+struct H {
+    cfg: Mutex<Cfg>,
+    cancels: Mutex<HashMap<String, Arc<AtomicBool>>>,
+}
+
+#[derive(Clone)]
 struct Cfg {
     base_url: String,
     model: String,
@@ -40,90 +47,23 @@ impl Cfg {
     }
 }
 
-struct Bus {
-    out: Arc<Mutex<std::io::Stdout>>,
-    next: u64,
+impl Default for Cfg {
+    fn default() -> Self {
+        Self::from(&Value::Null)
+    }
 }
 
-impl Bus {
-    fn send(&mut self, method: &str, params: Value, id: Option<Value>) {
-        let line = json!({"jsonrpc": "2.0", "method": method, "params": params, "id": id});
-        let s = serde_json::to_string(&line).unwrap();
-        let mut o = self.out.lock().unwrap();
-        writeln!(o, "{s}").unwrap();
-        o.flush().unwrap();
-    }
-
-    fn rpc(&mut self, stdin: &mut std::io::StdinLock<'_>, method: &str, params: Value) -> Value {
-        self.next += 1;
-        let id = json!(format!("ext-{}", self.next));
-        self.send(method, params, Some(id.clone()));
-        loop {
-            let mut line = String::new();
-            if stdin.read_line(&mut line).unwrap_or(0) == 0 {
-                return Value::Null;
+impl H {
+    async fn current_cfg(&self, client: &Client) -> Cfg {
+        match client.request("atom.config.get", json!({})).await {
+            Ok(v) => {
+                let c = Cfg::from(&v);
+                *self.cfg.lock().unwrap() = c.clone();
+                c
             }
-            if line.trim().is_empty() {
-                continue;
-            }
-            let v: Value = match serde_json::from_str(&line) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            if v.get("method").is_some() {
-                continue;
-            }
-            if let Some(rid) = v.get("id")
-                && key(rid) == key(&id)
-            {
-                return v.get("result").cloned().unwrap_or(Value::Null);
-            }
+            Err(_) => self.cfg.lock().unwrap().clone(),
         }
     }
-}
-
-fn key(id: &Value) -> String {
-    match id {
-        Value::String(s) => s.clone(),
-        o => o.to_string(),
-    }
-}
-
-fn emit_chunk(out: &Arc<Mutex<std::io::Stdout>>, stream: &str, seq: &mut u64, data: Value) {
-    *seq += 1;
-    let n = json!({"jsonrpc": "2.0", "method": "atom.stream.chunk",
-        "params": {"stream": stream, "seq": seq, "data": data}});
-    let mut o = out.lock().unwrap();
-    writeln!(o, "{}", serde_json::to_string(&n).unwrap()).unwrap();
-    o.flush().unwrap();
-}
-
-fn emit_end(out: &Arc<Mutex<std::io::Stdout>>, stream: &str, payload: Value) {
-    let mut obj = serde_json::Map::new();
-    obj.insert("stream".to_string(), Value::String(stream.to_string()));
-    if let Some(e) = payload.get("error") {
-        obj.insert("error".to_string(), e.clone());
-    } else {
-        obj.insert("result".to_string(), payload);
-    }
-    let n = json!({"jsonrpc": "2.0", "method": "atom.stream.end", "params": obj});
-    let mut o = out.lock().unwrap();
-    writeln!(o, "{}", serde_json::to_string(&n).unwrap()).unwrap();
-    o.flush().unwrap();
-}
-
-fn respond(out: &Arc<Mutex<std::io::Stdout>>, id: Value, result: Value) {
-    let r = json!({"jsonrpc": "2.0", "id": id, "result": result});
-    let mut o = out.lock().unwrap();
-    writeln!(o, "{}", serde_json::to_string(&r).unwrap()).unwrap();
-    o.flush().unwrap();
-}
-
-fn respond_err(out: &Arc<Mutex<std::io::Stdout>>, id: Value, code: i32, msg: String) {
-    let r = json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": msg}});
-    let mut o = out.lock().unwrap();
-    writeln!(o, "{}", serde_json::to_string(&r).unwrap()).unwrap();
-    o.flush().unwrap();
 }
 
 // --- tradução neutro ↔ Anthropic ---
@@ -208,9 +148,12 @@ fn to_anthropic_tools(tools: &[Value]) -> Vec<Value> {
         .collect()
 }
 
-fn api_key(bus: &mut Bus, stdin: &mut std::io::StdinLock<'_>, cfg: &Cfg) -> Option<String> {
-    match bus.rpc(stdin, "atom.secrets.get", json!({"name": cfg.api_key_from})) {
-        Value::String(s) if !s.is_empty() => Some(s),
+async fn api_key(client: &Client, cfg: &Cfg) -> Option<String> {
+    match client
+        .request("atom.secrets.get", json!({"name": cfg.api_key_from}))
+        .await
+    {
+        Ok(Value::String(s)) if !s.is_empty() => Some(s),
         _ => None,
     }
 }
@@ -290,41 +233,35 @@ fn do_complete(cfg: &Cfg, key: &str, p: &Value) -> Result<Value, String> {
     }))
 }
 
-fn stream_worker(
-    cfg: Cfg,
-    key: String,
-    p: Value,
-    stream: String,
-    out: Arc<Mutex<std::io::Stdout>>,
-    cancel: Arc<AtomicBool>,
-    invoke_id: Value,
-) {
+fn stream_run(
+    client: &Client,
+    cfg: &Cfg,
+    key: &str,
+    p: &Value,
+    stream: &str,
+    cancel: &AtomicBool,
+) -> Result<Value, RpcError> {
     let mut seq = 0u64;
-    let fail = |msg: String| {
-        emit_end(
-            &out,
-            &stream,
-            json!({"error": {"code": -32603, "message": msg}}),
+    let fail = |client: &Client, msg: String| {
+        client.stream_error(
+            stream,
+            RpcError::new(ErrorCode::INTERNAL_ERROR, msg.clone()),
         );
-        respond_err(&out, invoke_id.clone(), -32603, msg);
+        Err(RpcError::new(ErrorCode::INTERNAL_ERROR, msg))
     };
     let model = p
         .get("model")
         .and_then(|m| m.as_str())
         .unwrap_or(&cfg.model)
         .to_string();
-    let mut resp = match send_req(&cfg, &key, &body_for(&cfg, &model, &p, true)) {
+    let mut resp = match send_req(cfg, key, &body_for(cfg, &model, p, true)) {
         Ok(r) => r,
-        Err(e) => {
-            fail(e);
-            return;
-        }
+        Err(e) => return fail(client, e),
     };
     if !resp.status().is_success() {
         let st = resp.status();
         let t = resp.text().unwrap_or_default();
-        fail(format!("http {st}: {t}"));
-        return;
+        return fail(client, format!("http {st}: {t}"));
     }
     let mut buf = String::new();
     let mut ev_type = String::new();
@@ -334,30 +271,26 @@ fn stream_worker(
     let mut order: Vec<u64> = vec![];
     let mut usage = json!({});
     let mut stop = "stop".to_string();
-    let mut errored = false;
     let mut tmp = [0u8; 8192];
     loop {
         if cancel.load(Ordering::Relaxed) {
-            emit_end(
-                &out,
-                &stream,
-                json!({"error": {"code": -32800, "message": "cancelado"}}),
+            let msg = "cancelado".to_string();
+            client.stream_error(
+                stream,
+                RpcError::new(ErrorCode::REQUEST_CANCELLED, msg.clone()),
             );
-            respond_err(&out, invoke_id.clone(), -32800, "cancelado".to_string());
-            return;
+            return Err(RpcError::new(ErrorCode::REQUEST_CANCELLED, msg));
         }
         let n = match std::io::Read::read(&mut resp, &mut tmp) {
             Ok(0) => break,
             Ok(n) => n,
             Err(e) => {
-                emit_end(
-                    &out,
-                    &stream,
-                    json!({"error": {"code": -32603, "message": e.to_string()}}),
+                let msg = e.to_string();
+                client.stream_error(
+                    stream,
+                    RpcError::new(ErrorCode::INTERNAL_ERROR, msg.clone()),
                 );
-                respond_err(&out, invoke_id.clone(), -32603, e.to_string());
-                errored = true;
-                break;
+                return Err(RpcError::new(ErrorCode::INTERNAL_ERROR, msg));
             }
         };
         buf.push_str(&String::from_utf8_lossy(&tmp[..n]));
@@ -382,7 +315,8 @@ fn stream_worker(
                         Some("text_delta") => {
                             if let Some(t) = d.get("text").and_then(|v| v.as_str()) {
                                 text_acc.push_str(t);
-                                emit_chunk(&out, &stream, &mut seq, json!({"delta_text": t}));
+                                seq += 1;
+                                client.stream_chunk(stream, seq, json!({"delta_text": t}));
                             }
                         }
                         Some("input_json_delta") => {
@@ -396,10 +330,10 @@ fn stream_worker(
                                 if !order.contains(&idx) {
                                     order.push(idx);
                                 }
-                                emit_chunk(
-                                    &out,
-                                    &stream,
-                                    &mut seq,
+                                seq += 1;
+                                client.stream_chunk(
+                                    stream,
+                                    seq,
                                     json!({"delta_tool_call": {"id": e.0, "name": e.1, "input_delta": frag}}),
                                 );
                             }
@@ -444,9 +378,6 @@ fn stream_worker(
             }
         }
     }
-    if errored {
-        return;
-    }
     let mut parts = vec![];
     if !text_acc.is_empty() {
         parts.push(json!({"type": "text", "text": text_acc}));
@@ -461,139 +392,79 @@ fn stream_worker(
         stop = "tool_call".to_string();
     }
     let result = json!({"message": {"role": "assistant", "content": parts}, "usage": usage, "stop_reason": stop});
-    emit_end(&out, &stream, result.clone());
-    respond(&out, invoke_id, result);
+    client.stream_end(stream, result.clone());
+    Ok(result)
 }
 
-fn main() {
-    let stdin = std::io::stdin();
-    let out = Arc::new(Mutex::new(std::io::stdout()));
-    let mut bus = Bus {
-        out: out.clone(),
-        next: 0,
-    };
-    let mut cfg = Cfg::from(&Value::Null);
-    let cancels: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>> =
-        Arc::new(Mutex::new(HashMap::new()));
-    let mut stdin_lock = stdin.lock();
-    loop {
-        let mut line = String::new();
-        if stdin_lock.read_line(&mut line).unwrap_or(0) == 0 {
-            break;
-        }
-        if line.trim().is_empty() {
-            continue;
-        }
-        let req: Value = match serde_json::from_str(&line) {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("linha inválida: {e}");
-                continue;
-            }
-        };
-        let method = req
-            .get("method")
-            .and_then(|m| m.as_str())
-            .unwrap_or("")
-            .to_string();
-        let id = req.get("id").cloned();
-        let params = req.get("params").cloned().unwrap_or(Value::Null);
-        match method.as_str() {
-            "atom.exit" => break,
-            "atom.initialize" => {
-                let c = params.get("config").cloned().unwrap_or(Value::Null);
-                cfg = Cfg::from(&c);
-                if let Some(i) = id {
-                    respond(
-                        &out,
-                        i,
-                        json!({"protocol": "atom/1",
-                        "provides": [{"contract": "ai.llm@0", "version": "0.1.0"}]}),
-                    );
-                }
-            }
-            "atom.shutdown" => {
-                if let Some(i) = id {
-                    respond(&out, i, json!({}));
-                }
-            }
-            "atom.stream.cancel" => {
-                if let Some(s) = params.get("stream").and_then(|v| v.as_str())
-                    && let Some(f) = cancels.lock().unwrap().get(s)
-                {
-                    f.store(true, Ordering::Relaxed);
-                }
-            }
-            "service.invoke" => {
-                let svc = params.get("service").and_then(|s| s.as_str()).unwrap_or("");
-                let m = params.get("method").and_then(|x| x.as_str()).unwrap_or("");
-                let ip = params.get("params").cloned().unwrap_or(Value::Null);
-                let stream = params
-                    .get("stream")
-                    .and_then(|s| s.as_str())
-                    .map(|s| s.to_string());
-                match (svc, m) {
-                    ("ai.llm@0", "models") => {
-                        if let Some(i) = id {
-                            respond(&out, i, json!([{"id": cfg.model}]));
-                        }
-                    }
-                    ("ai.llm@0", "complete") => {
-                        let key = api_key(&mut bus, &mut stdin_lock, &cfg);
-                        let Some(key) = key else {
-                            let msg = format!(
-                                "secret {} ausente (`atom secret set {}`)",
-                                cfg.api_key_from, cfg.api_key_from
-                            );
-                            if let Some(i) = id.clone() {
-                                if let Some(s) = stream.clone() {
-                                    emit_end(
-                                        &out,
-                                        &s,
-                                        json!({"error": {"code": -32003, "message": msg}}),
-                                    );
-                                }
-                                respond_err(&out, i, -32003, msg);
-                            }
-                            continue;
-                        };
-                        match (stream, id) {
-                            (Some(s), Some(i)) => {
-                                let flag = Arc::new(AtomicBool::new(false));
-                                cancels.lock().unwrap().insert(s.clone(), flag.clone());
-                                let worker_cfg = Cfg {
-                                    base_url: cfg.base_url.clone(),
-                                    model: cfg.model.clone(),
-                                    api_key_from: cfg.api_key_from.clone(),
-                                    max_tokens: cfg.max_tokens,
-                                };
-                                let out2 = out.clone();
-                                let cancels2 = cancels.clone();
-                                let s2 = s.clone();
-                                std::thread::spawn(move || {
-                                    stream_worker(worker_cfg, key, ip, s2.clone(), out2, flag, i);
-                                    cancels2.lock().unwrap().remove(&s2);
-                                });
-                            }
-                            (None, Some(i)) => match do_complete(&cfg, &key, &ip) {
-                                Ok(v) => respond(&out, i, v),
-                                Err(e) => respond_err(&out, i, -32603, e),
-                            },
-                            _ => {}
-                        }
-                    }
-                    _ => {
-                        if let Some(i) = id {
-                            respond_err(&out, i, -32601, format!("método {svc}/{m} desconhecido"));
-                        }
-                    }
-                }
-            }
-            _ => {
-                if let Some(i) = id {
-                    respond_err(&out, i, -32601, format!("método {method} desconhecido"));
-                }
-            }
+impl Handler for H {
+    fn declare(&self) -> Declare {
+        Declare {
+            provides: vec![ProvidesEntry {
+                contract: "ai.llm@0".to_string(),
+                version: "0.1.0".to_string(),
+            }],
+            ..Declare::default()
         }
     }
+
+    async fn on_invoke(&self, client: &Client, inv: Invoke) -> Result<Value, RpcError> {
+        match (inv.service.as_str(), inv.method.as_str()) {
+            ("ai.llm@0", "models") => {
+                let cfg = self.current_cfg(client).await;
+                Ok(json!([{"id": cfg.model}]))
+            }
+            ("ai.llm@0", "complete") => {
+                let cfg = self.current_cfg(client).await;
+                let Some(key) = api_key(client, &cfg).await else {
+                    let msg = format!(
+                        "secret {} ausente (`atom secret set {}`)",
+                        cfg.api_key_from, cfg.api_key_from
+                    );
+                    if let Some(s) = inv.stream.clone() {
+                        client.stream_error(
+                            &s,
+                            RpcError::new(ErrorCode::CAPABILITY_DENIED, msg.clone()),
+                        );
+                    }
+                    return Err(RpcError::new(ErrorCode::CAPABILITY_DENIED, msg));
+                };
+                match inv.stream.clone() {
+                    Some(s) => {
+                        let flag = Arc::new(AtomicBool::new(false));
+                        self.cancels.lock().unwrap().insert(s.clone(), flag.clone());
+                        let c2 = client.clone();
+                        let (cfg_c, p_c) = (cfg.clone(), inv.params.clone());
+                        let out = tokio::task::spawn_blocking(move || {
+                            stream_run(&c2, &cfg_c, &key, &p_c, &s, &flag)
+                        })
+                        .await
+                        .map_err(|e| RpcError::new(ErrorCode::INTERNAL_ERROR, e.to_string()))?;
+                        self.cancels.lock().unwrap().remove(&inv.stream.unwrap());
+                        out
+                    }
+                    None => do_complete(&cfg, &key, &inv.params)
+                        .map_err(|e| RpcError::new(ErrorCode::INTERNAL_ERROR, e)),
+                }
+            }
+            (s, m) => Err(RpcError::new(
+                ErrorCode::METHOD_NOT_FOUND,
+                format!("método {s}/{m} desconhecido"),
+            )),
+        }
+    }
+
+    async fn on_stream_cancel(&self, _client: &Client, stream: &str) {
+        if let Some(f) = self.cancels.lock().unwrap().get(stream) {
+            f.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
+#[tokio::main]
+async fn main() {
+    atom_sdk::run(H {
+        cfg: Mutex::new(Cfg::default()),
+        cancels: Mutex::new(HashMap::new()),
+    })
+    .await;
 }
