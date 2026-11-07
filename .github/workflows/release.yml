@@ -121,10 +121,14 @@ jobs:
           ver="${GITHUB_REF_NAME#*@}"
           dir="${{ needs.meta.outputs.dir }}"
           mkdir -p out
+          # `--key` espera arquivo (0600); o secret é a seed `ed25519-seed:BASE64`.
+          umask 077
+          printf '%s' "$ATOM_PUBLISHER_KEY" > /tmp/publisher.key
           for plat in linux-amd64 linux-arm64 darwin-arm64 darwin-amd64 windows-amd64; do
             [ -d "staged/pkg-$plat" ] || continue
-            atom ext pack "$dir" --platform "$plat" --key "$ATOM_PUBLISHER_KEY" --out-dir out/
+            atom ext pack "$dir" --platform "$plat" --key /tmp/publisher.key --out-dir out/
           done
+          rm -f /tmp/publisher.key
           gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" out/*.tar.gz
           # PR na loja (v1; v2 quando o core tiver a ferramenta pub v2 — E0.1):
           # `atom ext publish --store-dir` mescla `out/*.index.json` sem a chave da loja.
