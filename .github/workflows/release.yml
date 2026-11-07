@@ -126,6 +126,7 @@ jobs:
           atom --version || { echo "atom CLI indisponível"; exit 1; }
           name="${GITHUB_REF_NAME%@*}"
           ver="${GITHUB_REF_NAME#*@}"
+          dir="${{ needs.meta.outputs.dir }}"
           mkdir -p out
           # `--key` espera arquivo (0600); o secret é a seed `ed25519-seed:BASE64`.
           umask 077
