@@ -101,6 +101,8 @@ jobs:
       always() && needs.meta.result == 'success' &&
       (needs.build.result == 'success' || needs.build.result == 'skipped')
     runs-on: ubuntu-latest
+    permissions:
+      contents: write # cria a Release neste repo (GITHUB_TOKEN)
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
@@ -109,7 +111,7 @@ jobs:
       - name: pack + release + PR na loja
         env:
           ATOM_PUBLISHER_KEY: ${{ secrets.ATOM_PUBLISHER_KEY }}
-          GH_TOKEN: ${{ secrets.ATOM_STORE_TOKEN }}
+          STORE_TOKEN: ${{ secrets.ATOM_STORE_TOKEN }}
           ATOM_STORE_REPO: ${{ vars.ATOM_STORE_REPO }}
           ATOM_VERSION: ${{ vars.ATOM_VERSION }}
         run: |
@@ -132,9 +134,9 @@ jobs:
           gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" out/*.tar.gz
           # PR na loja (v1; v2 quando o core tiver a ferramenta pub v2 — E0.1):
           # `atom ext publish --store-dir` mescla `out/*.index.json` sem a chave da loja.
-          git clone "https://x-access-token:${GH_TOKEN}@github.com/${ATOM_STORE_REPO}.git" /tmp/atom-store
+          git clone "https://x-access-token:${STORE_TOKEN}@github.com/${ATOM_STORE_REPO}.git" /tmp/atom-store
           atom ext publish --store-dir /tmp/atom-store/v1 --package "$name" --version "$ver" out/*.index.json
           (cd /tmp/atom-store && git checkout -b "pkg/${GITHUB_REF_NAME}" \
             && git add v1 && git commit -m "publish ${GITHUB_REF_NAME}" && git push -u origin HEAD)
-          gh pr create -R "$ATOM_STORE_REPO" --head "pkg/${GITHUB_REF_NAME}" \
+          GH_TOKEN="$STORE_TOKEN" gh pr create -R "$ATOM_STORE_REPO" --head "pkg/${GITHUB_REF_NAME}" \
             --title "publish ${GITHUB_REF_NAME}" --body "Publicação de ${GITHUB_REF_NAME} (release.yml)."
